@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package kubesavings.v1;
+
+message WorkloadMetrics {
+  string namespace = 1;
+  string workload_type = 2;
+  string workload_name = 3;
+  string container_name = 4;
+  uint32 replicas = 5;
+  uint32 cpu_request_m = 6;
+  uint32 cpu_limit_m = 7;
+  uint32 memory_request_mi = 8;
+  uint32 memory_limit_mi = 9;
+  double actual_cpu_avg_m = 10;
+  double actual_cpu_p95_m = 11;
+  double actual_memory_avg_mi = 12;
+  double actual_memory_p95_mi = 13;
+  uint32 observation_days = 14;
+  double estimated_monthly_cost_usd = 15;
+  string last_active_timestamp = 16;
+}
+
+message NamespaceMetrics {
+  string name = 1;
+  uint32 workload_count = 2;
+  uint32 days_since_last_activity = 3;
+  double estimated_monthly_cost_usd = 4;
+}
+
+message AgentSnapshot {
+  string k8s_version = 1;
+  uint32 node_count = 2;
+  string cloud_provider = 3;
+  repeated WorkloadMetrics workloads = 4;
+  repeated NamespaceMetrics namespaces = 5;
+  double estimated_cluster_cost_usd = 6;
+  string collected_at = 7;
+}
+
+message SnapshotResponse {
+  int64 recommendations = 1;
+  double total_savings_usd = 2;
+}

@@ -1,0 +1,16 @@
+apiVersion: v2
+name: kubesavings-agent
+description: KubeSavings Kubernetes cost optimization agent
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+home: https://kubesavings.io
+sources:
+  - https://github.com/kubesavings/agent
+keywords:
+  - kubernetes
+  - cost-optimization
+  - finops
+maintainers:
+  - name: KubeSavings Team
+    email: support@kubesavings.io

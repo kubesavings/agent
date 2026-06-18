@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "semanticCommitType": "build",
+      "groupName": "cargo dependencies"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "semanticCommitType": "ci",
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchManagers": ["dockerfile"],
+      "semanticCommitType": "build"
+    },
+    {
+      "matchManagers": ["helm-values"],
+      "semanticCommitType": "build"
+    }
+  ]
+}

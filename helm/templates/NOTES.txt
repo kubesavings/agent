@@ -1,0 +1,22 @@
+KubeSavings Agent has been deployed.
+
+CronJob:  {{ include "kubesavings-agent.fullname" . }}
+Schedule: {{ .Values.agent.schedule }}
+Namespace: {{ .Release.Namespace }}
+
+The agent will run on the configured schedule and send cluster cost snapshots to:
+  {{ .Values.agent.apiEndpoint }}
+
+To trigger a one-off run immediately:
+  kubectl create job --from=cronjob/{{ include "kubesavings-agent.fullname" . }} \
+    kubesavings-agent-manual -n {{ .Release.Namespace }}
+
+To tail logs from the last run:
+  kubectl logs -n {{ .Release.Namespace }} \
+    -l app.kubernetes.io/name=kubesavings-agent --tail=100
+{{- if not .Values.agent.existingSecret }}
+
+NOTE: API credentials are stored in Secret '{{ include "kubesavings-agent.fullname" . }}'.
+      Consider using agent.existingSecret to manage credentials externally
+      (e.g. via Sealed Secrets or External Secrets Operator).
+{{- end }}

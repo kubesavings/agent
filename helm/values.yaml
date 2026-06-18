@@ -1,0 +1,53 @@
+agent:
+  # Required when existingSecret is not set
+  apiKey: ""
+  clusterId: ""
+
+  # Use an existing Secret instead of creating one from apiKey/clusterId above.
+  # The Secret must contain keys api-key and cluster-id (or override below).
+  existingSecret: ""
+  existingSecretApiKeyKey: "api-key"
+  existingSecretClusterIdKey: "cluster-id"
+
+  apiEndpoint: "https://app.kubesavings.io"
+  includeNamespaces: ""
+  excludeNamespaces: "kube-system,kube-public,kube-node-lease"
+  cloudProvider: ""
+
+  # Extra environment variables injected into the agent container.
+  # Useful for RUST_LOG or proxy settings.
+  # extraEnv:
+  #   - name: RUST_LOG
+  #     value: debug
+
+  schedule: "0 * * * *"
+
+  image:
+    repository: ghcr.io/kubesavings/agent
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+serviceAccount:
+  create: true
+  name: "kubesavings-agent"
+  annotations: {}
+
+networkPolicy:
+  enabled: true
