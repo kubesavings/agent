@@ -51,22 +51,43 @@ The execution flow is strictly linear — `main.rs` calls three modules in seque
 
 ## Release
 
-Releasing is triggered by pushing a `v*` tag. The workflow (`.github/workflows/release.yml`) runs two jobs in sequence:
+The chart and the image are versioned **independently**, each from its own
+source-of-truth file. Releases are triggered by a push to `main` — no manual git
+tags. The workflow (`.github/workflows/release.yml`) detects what changed and runs
+only the matching job:
 
-1. **image** — builds the Docker image via the multi-stage `Dockerfile` and pushes to GHCR:
+1. **image** — runs when code changes (`src/**`, `proto/**`, `build.rs`,
+   `Cargo.toml`, `Cargo.lock`, `Dockerfile`). Version = `Cargo.toml` `version`.
+   Builds the multi-stage `Dockerfile` and pushes to GHCR:
    ```
    ghcr.io/<owner>/kubesavings-agent:<version>
    ghcr.io/<owner>/kubesavings-agent:<major>.<minor>
    ```
-2. **helm** — stamps the image tag into `helm/values.yaml`, packages the chart, and pushes it as an OCI artifact to GHCR:
+2. **helm** — runs when `helm/**` changes. Chart version = `helm/Chart.yaml`
+   `version`; `appVersion` (the image the chart deploys, kept in `Chart.yaml` and
+   `values.yaml`) tracks the image version. Packages the chart and pushes it as an
+   OCI artifact to GHCR:
    ```
-   ghcr.io/<owner>/charts/kubesavings-agent:<version>
+   ghcr.io/<owner>/charts/kubesavings-agent:<chart-version>
    ```
 
-To cut a release:
+**Versioning rule:** code change → bump `Cargo.toml` `version` (new image).
+Chart change (templates, or pointing `values.yaml`/`appVersion` at a new image) →
+bump `helm/Chart.yaml` `version` (new chart). A change that ships a new agent
+feature touches both: bump the app version, and bump the chart version + its
+`appVersion`/`values.yaml` image tag so users get the new image.
+
+To cut a release, just merge to `main`:
 ```bash
-git tag v1.2.3 && git push origin v1.2.3
+# edit Cargo.toml version (code) and/or helm/Chart.yaml version (chart), then:
+git push origin main
 ```
+
+**Public visibility (one-time):** GHCR packages are private by default and there
+is no API to change visibility, so it must be set once per package (it then sticks
+for all future tags). Either set the org default (Settings → Packages → "Package
+creation" → Public), or after the first publish open each package's settings →
+"Change visibility" → Public.
 
 To install/upgrade from the published chart:
 ```bash

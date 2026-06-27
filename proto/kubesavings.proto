@@ -28,6 +28,13 @@ message NamespaceMetrics {
   double estimated_monthly_cost_usd = 4;
 }
 
+message NodePool {
+  string instance_type = 1;   // e.g. "m5.xlarge"; "" if label missing
+  string region        = 2;   // e.g. "us-east-1"; "" if unknown
+  string capacity_type = 3;   // "on-demand" | "spot" | ""
+  uint32 node_count    = 4;   // nodes in this group
+}
+
 message AgentSnapshot {
   string k8s_version = 1;
   uint32 node_count = 2;
@@ -36,6 +43,8 @@ message AgentSnapshot {
   repeated NamespaceMetrics namespaces = 5;
   double estimated_cluster_cost_usd = 6;
   string collected_at = 7;
+  string region = 8;                   // primary/most-common cluster region; "" if mixed/unknown
+  repeated NodePool node_pools = 9;
 }
 
 message SnapshotResponse {

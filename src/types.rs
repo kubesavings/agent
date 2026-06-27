@@ -5,4 +5,4 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/kubesavings.v1.rs"));
 }
 
-pub use proto::{AgentSnapshot, NamespaceMetrics, SnapshotResponse, WorkloadMetrics};
+pub use proto::{AgentSnapshot, NamespaceMetrics, NodePool, SnapshotResponse, WorkloadMetrics};

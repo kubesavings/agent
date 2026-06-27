@@ -1,35 +1,69 @@
 name: Release
 
+# Chart and image are versioned independently and released by what changed:
+#   - code (src/proto/build/Dockerfile/Cargo) → build & push the image at the
+#     version in Cargo.toml
+#   - helm/**                                  → package & push the chart at the
+#     version in helm/Chart.yaml
+# No manual git tags: a push to main releases whatever changed.
+#
+# NOTE: GHCR packages are PRIVATE by default and GitHub has no API to change a
+# package's visibility. To publish publicly, set it once (it then sticks for all
+# future tags): either org Settings → Packages → "Package creation" default to
+# Public, or each package's settings → "Change visibility" → Public after the
+# first publish. See the Release section in CLAUDE.md.
+
 on:
   push:
-    branches: ["**"]
-    tags: ["v*"]
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/kubesavings-agent
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.filter.outputs.image }}
+      chart: ${{ steps.filter.outputs.chart }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            image:
+              - 'src/**'
+              - 'proto/**'
+              - 'build.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Dockerfile'
+            chart:
+              - 'helm/**'
+
   image:
     name: Build & push image
+    needs: changes
+    if: needs.changes.outputs.image == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
 
-      # Tag push v1.2.3 → "1.2.3"; branch push → "0.0.0-<short sha>"
-      - name: Compute version
+      # Image version is the application version from Cargo.toml.
+      - name: Read image version from Cargo.toml
         id: version
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          fi
+          VERSION=$(grep -m1 '^version *= *' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${VERSION%.*}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -48,7 +82,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.major_minor }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -62,8 +96,9 @@ jobs:
 
   helm:
     name: Publish Helm chart
+    needs: changes
+    if: needs.changes.outputs.chart == 'true'
     runs-on: ubuntu-latest
-    needs: image
     permissions:
       contents: read
       packages: write
@@ -73,21 +108,26 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
+      # Chart version comes from Chart.yaml; appVersion (the image it deploys)
+      # is maintained there too, so the packaged chart is self-describing.
+      - name: Read chart versions
+        id: version
+        run: |
+          CHART_VERSION=$(grep -m1 '^version:' helm/Chart.yaml | sed -E 's/^version: *"?([^"]+)"?.*/\1/')
+          APP_VERSION=$(grep -m1 '^appVersion:' helm/Chart.yaml | sed -E 's/^appVersion: *"?([^"]+)"?.*/\1/')
+          echo "chart=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "app=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR (OCI)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} --username ${{ github.actor }} --password-stdin
 
-      - name: Stamp image into chart values
-        run: |
-          VERSION="${{ needs.image.outputs.version }}"
-          sed -i "s|repository: .*|repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}|" helm/values.yaml
-          sed -i "s|tag: .*|tag: \"${VERSION}\"|" helm/values.yaml
-
       - name: Package chart
         run: |
-          VERSION="${{ needs.image.outputs.version }}"
-          helm package helm/ --version "${VERSION}" --app-version "${VERSION}"
+          helm package helm/ \
+            --version "${{ steps.version.outputs.chart }}" \
+            --app-version "${{ steps.version.outputs.app }}"
 
       - name: Push chart to GHCR
         run: |
-          VERSION="${{ needs.image.outputs.version }}"
-          helm push "kubesavings-agent-${VERSION}.tgz" oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
+          helm push "kubesavings-agent-${{ steps.version.outputs.chart }}.tgz" \
+            oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts

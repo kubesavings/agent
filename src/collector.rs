@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
@@ -10,10 +10,17 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::types::{AgentSnapshot, NamespaceMetrics, WorkloadMetrics};
+use crate::types::{AgentSnapshot, NamespaceMetrics, NodePool, WorkloadMetrics};
 
 const CPU_COST_PER_VCPU_HOUR: f64 = 0.048;
 const MEM_COST_PER_GB_HOUR: f64 = 0.006;
+
+// Node label keys for cost-pricing metadata. Each has a current key and a legacy
+// (pre-1.17 `beta`/`failure-domain`) key kept as a fallback for older nodes.
+const LABEL_INSTANCE_TYPE: &str = "node.kubernetes.io/instance-type";
+const LABEL_INSTANCE_TYPE_LEGACY: &str = "beta.kubernetes.io/instance-type";
+const LABEL_REGION: &str = "topology.kubernetes.io/region";
+const LABEL_REGION_LEGACY: &str = "failure-domain.beta.kubernetes.io/region";
 
 #[derive(Debug, Error)]
 pub enum CollectorError {
@@ -124,6 +131,138 @@ fn days_since(ts: &DateTime<Utc>) -> u32 {
     Utc::now().signed_duration_since(*ts).num_days().max(0) as u32
 }
 
+/// Map a node's `spec.providerID` to a canonical cloud-provider name.
+///
+/// The providerID is formatted `<scheme>://<provider-specific-id>`. We take the
+/// scheme and normalize the well-known ones (`gce` → `gcp`). An empty providerID
+/// (or one without a scheme) yields "" — we report unknown rather than guess.
+fn parse_provider_id(provider_id: &str) -> String {
+    match provider_id.split_once("://") {
+        Some(("aws", _)) => "aws".to_string(),
+        Some(("gce", _)) => "gcp".to_string(),
+        Some(("azure", _)) => "azure".to_string(),
+        Some((scheme, _)) => scheme.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Best-effort spot/preemptible detection from node labels. Treats the node as
+/// "spot" if any of the Karpenter / EKS / GKE / AKS spot signals are present,
+/// otherwise "on-demand".
+fn capacity_type_from_labels(labels: &BTreeMap<String, String>) -> &'static str {
+    let is_spot = labels
+        .get("karpenter.sh/capacity-type")
+        .is_some_and(|v| v == "spot")
+        || labels
+            .get("eks.amazonaws.com/capacityType")
+            .is_some_and(|v| v == "SPOT")
+        || labels
+            .get("cloud.google.com/gke-spot")
+            .is_some_and(|v| v == "true")
+        || labels
+            .get("kubernetes.azure.com/scalesetpriority")
+            .is_some_and(|v| v == "spot");
+    if is_spot {
+        "spot"
+    } else {
+        "on-demand"
+    }
+}
+
+/// Per-node pricing metadata extracted from labels and `spec.providerID`.
+struct NodeMeta {
+    instance_type: String,
+    region: String,
+    capacity_type: String,
+    provider: String,
+}
+
+fn node_meta(node: &Node) -> NodeMeta {
+    let empty = BTreeMap::new();
+    let labels = node.metadata.labels.as_ref().unwrap_or(&empty);
+
+    let instance_type = labels
+        .get(LABEL_INSTANCE_TYPE)
+        .or_else(|| labels.get(LABEL_INSTANCE_TYPE_LEGACY))
+        .cloned()
+        .unwrap_or_default();
+    let region = labels
+        .get(LABEL_REGION)
+        .or_else(|| labels.get(LABEL_REGION_LEGACY))
+        .cloned()
+        .unwrap_or_default();
+    let capacity_type = capacity_type_from_labels(labels).to_string();
+    let provider = node
+        .spec
+        .as_ref()
+        .and_then(|s| s.provider_id.as_deref())
+        .map(parse_provider_id)
+        .unwrap_or_default();
+
+    NodeMeta {
+        instance_type,
+        region,
+        capacity_type,
+        provider,
+    }
+}
+
+/// Group nodes into pools keyed by (instance_type, region, capacity_type) and
+/// derive the cluster's primary region and cloud provider.
+///
+/// Returns `(node_pools, primary_region, cloud_provider)`. Nodes missing the
+/// instance-type label still count toward a pool (with `instance_type == ""`).
+/// The primary region is the most-common non-empty region (ties broken
+/// alphabetically for deterministic output); "" if no node reports a region.
+/// The cloud provider is the first non-empty providerID-derived value.
+pub fn aggregate_node_pools(nodes: &[Node]) -> (Vec<NodePool>, String, String) {
+    let mut counts: HashMap<(String, String, String), u32> = HashMap::new();
+    let mut region_counts: HashMap<String, u32> = HashMap::new();
+    let mut provider = String::new();
+
+    for node in nodes {
+        let meta = node_meta(node);
+        if provider.is_empty() && !meta.provider.is_empty() {
+            provider = meta.provider.clone();
+        }
+        if !meta.region.is_empty() {
+            *region_counts.entry(meta.region.clone()).or_default() += 1;
+        }
+        *counts
+            .entry((meta.instance_type, meta.region, meta.capacity_type))
+            .or_default() += 1;
+    }
+
+    let mut node_pools: Vec<NodePool> = counts
+        .into_iter()
+        .map(
+            |((instance_type, region, capacity_type), node_count)| NodePool {
+                instance_type,
+                region,
+                capacity_type,
+                node_count,
+            },
+        )
+        .collect();
+    // Deterministic ordering keeps snapshots stable across runs and testable.
+    node_pools.sort_by(|a, b| {
+        (&a.instance_type, &a.region, &a.capacity_type).cmp(&(
+            &b.instance_type,
+            &b.region,
+            &b.capacity_type,
+        ))
+    });
+
+    // Most-common region wins; on a tie pick the alphabetically smallest.
+    let region = region_counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(r, _)| r)
+        .unwrap_or_default();
+
+    (node_pools, region, provider)
+}
+
 pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
     let client = Client::try_default().await?;
 
@@ -135,23 +274,33 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
     let nodes = nodes_api.list(&ListParams::default()).await?;
     let node_count = nodes.items.len() as u32;
 
-    // Auto-detect cloud provider from node labels if not set in config
-    let cloud_provider = config.cloud_provider.clone().or_else(|| {
-        nodes.items.first().and_then(|n| {
-            let labels = n.metadata.labels.as_ref()?;
-            if labels.contains_key("eks.amazonaws.com/nodegroup")
-                || labels.contains_key("alpha.eksctl.io/cluster-name")
-            {
-                Some("AWS".to_string())
-            } else if labels.contains_key("cloud.google.com/gke-nodepool") {
-                Some("GCP".to_string())
-            } else if labels.contains_key("kubernetes.azure.com/agentpool") {
-                Some("Azure".to_string())
-            } else {
-                None
-            }
-        })
-    });
+    // Aggregate per-node pricing metadata: pools grouped by
+    // (instance_type, region, capacity_type), the primary region, and the
+    // providerID-derived cloud provider.
+    let (node_pools, region, provider_from_nodes) = aggregate_node_pools(&nodes.items);
+
+    // Cloud provider: explicit config wins, then the providerID-derived value,
+    // then a best-effort label heuristic for nodes that don't expose a providerID.
+    let cloud_provider = config
+        .cloud_provider
+        .clone()
+        .or_else(|| (!provider_from_nodes.is_empty()).then(|| provider_from_nodes.clone()))
+        .or_else(|| {
+            nodes.items.first().and_then(|n| {
+                let labels = n.metadata.labels.as_ref()?;
+                if labels.contains_key("eks.amazonaws.com/nodegroup")
+                    || labels.contains_key("alpha.eksctl.io/cluster-name")
+                {
+                    Some("AWS".to_string())
+                } else if labels.contains_key("cloud.google.com/gke-nodepool") {
+                    Some("GCP".to_string())
+                } else if labels.contains_key("kubernetes.azure.com/agentpool") {
+                    Some("Azure".to_string())
+                } else {
+                    None
+                }
+            })
+        });
 
     // Determine target namespaces
     let target_namespaces = get_target_namespaces(&client, config).await?;
@@ -358,6 +507,8 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
         namespaces,
         estimated_cluster_cost_usd,
         collected_at: Utc::now().to_rfc3339(),
+        region,
+        node_pools,
     })
 }
 
@@ -1037,5 +1188,121 @@ mod tests {
             }]
         });
         assert!(parse_pod_metrics_json(&body).is_empty());
+    }
+
+    // ── Node pricing metadata: providerID parsing + pool aggregation ────────────
+
+    #[test]
+    fn test_parse_provider_id() {
+        assert_eq!(parse_provider_id("aws:///us-east-1a/i-0abc123"), "aws");
+        assert_eq!(
+            parse_provider_id("gce://my-proj/us-central1-a/gke-node"),
+            "gcp"
+        );
+        assert_eq!(
+            parse_provider_id("azure:///subscriptions/x/resourceGroups/y/vm/z"),
+            "azure"
+        );
+        assert_eq!(parse_provider_id(""), "");
+        // Unknown scheme passes through; a value with no scheme is unknown.
+        assert_eq!(parse_provider_id("digitalocean://12345"), "digitalocean");
+        assert_eq!(parse_provider_id("no-scheme"), "");
+    }
+
+    /// Build a minimal Node with the given labels and providerID.
+    fn node_fixture(labels: Value, provider_id: &str) -> Node {
+        serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "n", "labels": labels },
+            "spec": { "providerID": provider_id }
+        }))
+        .expect("node fixture should deserialize")
+    }
+
+    #[test]
+    fn test_aggregate_node_pools_mixed() {
+        let on_demand_labels = json!({
+            "node.kubernetes.io/instance-type": "m5.large",
+            "topology.kubernetes.io/region": "us-east-1"
+        });
+        let spot_labels = json!({
+            "node.kubernetes.io/instance-type": "m5.large",
+            "topology.kubernetes.io/region": "us-east-1",
+            "karpenter.sh/capacity-type": "spot"
+        });
+        // No instance-type label, but still in the region and counted.
+        let no_type_labels = json!({
+            "topology.kubernetes.io/region": "us-east-1"
+        });
+
+        let nodes = vec![
+            node_fixture(on_demand_labels.clone(), "aws:///us-east-1a/i-1"),
+            node_fixture(on_demand_labels, "aws:///us-east-1a/i-2"),
+            node_fixture(spot_labels, "aws:///us-east-1b/i-3"),
+            node_fixture(no_type_labels, "aws:///us-east-1c/i-4"),
+        ];
+
+        let (pools, region, provider) = aggregate_node_pools(&nodes);
+
+        assert_eq!(region, "us-east-1");
+        assert_eq!(provider, "aws");
+
+        // node_count across all pools must still equal the 4 input nodes.
+        let total: u32 = pools.iter().map(|p| p.node_count).sum();
+        assert_eq!(total, 4);
+
+        let find = |it: &str, cap: &str| {
+            pools
+                .iter()
+                .find(|p| {
+                    p.instance_type == it && p.region == "us-east-1" && p.capacity_type == cap
+                })
+                .map(|p| p.node_count)
+        };
+        assert_eq!(find("m5.large", "on-demand"), Some(2));
+        assert_eq!(find("m5.large", "spot"), Some(1));
+        assert_eq!(find("", "on-demand"), Some(1));
+        assert_eq!(pools.len(), 3);
+    }
+
+    #[test]
+    fn test_node_meta_legacy_labels_and_no_provider() {
+        // Legacy label keys are honored; an empty providerID stays unknown.
+        let node = node_fixture(
+            json!({
+                "beta.kubernetes.io/instance-type": "n1-standard-4",
+                "failure-domain.beta.kubernetes.io/region": "europe-west1"
+            }),
+            "",
+        );
+        let meta = node_meta(&node);
+        assert_eq!(meta.instance_type, "n1-standard-4");
+        assert_eq!(meta.region, "europe-west1");
+        assert_eq!(meta.capacity_type, "on-demand");
+        assert_eq!(meta.provider, "");
+    }
+
+    #[test]
+    fn test_capacity_type_spot_signals() {
+        let spot_signals = [
+            ("eks.amazonaws.com/capacityType", "SPOT"),
+            ("cloud.google.com/gke-spot", "true"),
+            ("kubernetes.azure.com/scalesetpriority", "spot"),
+            ("karpenter.sh/capacity-type", "spot"),
+        ];
+        for (key, val) in spot_signals {
+            let mut labels = BTreeMap::new();
+            labels.insert(key.to_string(), val.to_string());
+            assert_eq!(capacity_type_from_labels(&labels), "spot", "for {key}");
+        }
+        // On-demand / absent signals.
+        let mut on_demand = BTreeMap::new();
+        on_demand.insert(
+            "eks.amazonaws.com/capacityType".to_string(),
+            "ON_DEMAND".to_string(),
+        );
+        assert_eq!(capacity_type_from_labels(&on_demand), "on-demand");
+        assert_eq!(capacity_type_from_labels(&BTreeMap::new()), "on-demand");
     }
 }
