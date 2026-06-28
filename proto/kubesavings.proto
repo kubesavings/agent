@@ -59,6 +59,7 @@ message AgentSnapshot {
   string collected_at = 7;
   string region = 8;                   // primary/most-common cluster region; "" if mixed/unknown
   repeated NodePool node_pools = 9;
+  string agent_version = 10;            // kubesavings-agent version (CARGO_PKG_VERSION); "" if unknown
 }
 
 message SnapshotResponse {

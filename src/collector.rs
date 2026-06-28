@@ -509,6 +509,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
         collected_at: Utc::now().to_rfc3339(),
         region,
         node_pools,
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
