@@ -19,6 +19,20 @@ message WorkloadMetrics {
   uint32 observation_days = 14;
   double estimated_monthly_cost_usd = 15;
   string last_active_timestamp = 16;
+
+  // --- Autoscaler context (all optional; 0 / false / "" means "not present",
+  // so the backend checks no-op until the agent starts populating them) ---
+  bool has_hpa = 17;                  // a HorizontalPodAutoscaler targets this workload
+  uint32 hpa_min_replicas = 18;       // HPA spec.minReplicas
+  uint32 hpa_max_replicas = 19;       // HPA spec.maxReplicas
+  uint32 hpa_target_cpu_pct = 20;     // HPA averageUtilization target for CPU (%)
+  uint32 hpa_current_replicas = 21;   // HPA status.currentReplicas
+  bool cronjob_suspended = 22;        // CronJob spec.suspend
+  string cronjob_last_schedule_ts = 23; // CronJob status.lastScheduleTime (RFC3339); "" if never
+  uint32 cronjob_recent_failures = 24;  // failed Jobs owned by this CronJob in the recent window
+  bool keda_scaled = 25;              // a KEDA ScaledObject targets this workload
+  uint32 keda_min_replicas = 26;      // KEDA spec.minReplicaCount
+  string keda_trigger_types = 27;     // comma-separated KEDA trigger types (e.g. "kafka,cron"); "" if none
 }
 
 message NamespaceMetrics {
