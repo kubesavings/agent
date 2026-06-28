@@ -62,6 +62,7 @@ message AgentSnapshot {
 }
 
 message SnapshotResponse {
-  int64 recommendations = 1;
-  double total_savings_usd = 2;
+  string status = 1;                 // "accepted"
+  uint32 recommendations = 2;        // open recommendation count
+  double total_savings_usd = 3;
 }

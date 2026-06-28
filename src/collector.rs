@@ -717,6 +717,9 @@ fn build_workload_metrics(
         observation_days,
         estimated_monthly_cost_usd: monthly_cost(cpu_request_m, memory_request_mi, replicas),
         last_active_timestamp: String::new(),
+        // Autoscaler fields (HPA/CronJob/KEDA) are not collected yet; leave them at
+        // their proto zero-values so the backend checks treat them as "not present".
+        ..Default::default()
     }
 }
 
