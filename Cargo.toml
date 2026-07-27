@@ -1,6 +1,6 @@
 [package]
 name = "kubesavings-agent"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "KubeSavings Kubernetes metrics collector agent"
 
@@ -29,6 +29,7 @@ prost-build = "0.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+wiremock = "0.6.5"
 
 [[bench]]
 name = "collector_bench"

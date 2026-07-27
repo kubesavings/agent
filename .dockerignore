@@ -1,0 +1,13 @@
+# Keep the build context to just what the image build needs. `COPY . .` would
+# otherwise pull in the local build output and the full git history.
+#
+# Note: benches/ must stay in the context. Cargo.toml declares [[bench]] targets
+# explicitly, and Cargo validates those paths when it parses the manifest — even
+# for `cargo build`, which never compiles them. Excluding them fails the build.
+target/
+.git/
+.github/
+helm/
+*.md
+.gitignore
+.dockerignore

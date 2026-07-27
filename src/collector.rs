@@ -74,47 +74,66 @@ impl WorkloadUsage {
 // Key: (namespace, workload_type, workload_name, container_name)
 type UsageMap = HashMap<(String, String, String, String), WorkloadUsage>;
 
-/// Parse Kubernetes CPU string to millicores.
-/// Examples: "500m" → 500, "2" → 2000, "100n" → 0
-pub fn parse_cpu_to_millicores(s: &str) -> u32 {
+/// Parse a Kubernetes CPU quantity to millicores, preserving fractional precision.
+///
+/// metrics-server reports CPU in nanocores, so a sidecar drawing `"800000n"` is
+/// 0.8m. Rounding that to an integer would report the container as completely
+/// idle and drive its rightsizing recommendation to zero, so the usage path
+/// keeps the fractional value. Requests and limits use
+/// [`parse_cpu_to_millicores`], whose integer form matches the protobuf schema.
+///
+/// Examples: "500m" → 500.0, "2" → 2000.0, "100n" → 0.0001
+pub fn parse_cpu_millicores(s: &str) -> f64 {
+    let s = s.trim();
     if let Some(m) = s.strip_suffix('m') {
-        m.parse().unwrap_or(0)
+        m.parse().unwrap_or(0.0)
     } else if let Some(n) = s.strip_suffix('n') {
         // nanocores → millicores (1m = 1_000_000n)
-        (n.parse::<u64>().unwrap_or(0) / 1_000_000) as u32
+        n.parse::<f64>().unwrap_or(0.0) / 1_000_000.0
     } else if let Some(u) = s.strip_suffix('u') {
         // microcores → millicores
-        (u.parse::<u64>().unwrap_or(0) / 1_000) as u32
+        u.parse::<f64>().unwrap_or(0.0) / 1_000.0
     } else {
         // whole cores
-        (s.parse::<f64>().unwrap_or(0.0) * 1000.0) as u32
+        s.parse::<f64>().unwrap_or(0.0) * 1000.0
     }
 }
 
-/// Parse Kubernetes memory string to MiB.
-/// Handles: Ki, Mi, Gi, Ti, K, M, G, T, and plain bytes.
-pub fn parse_memory_to_mib(s: &str) -> u32 {
+/// Parse a Kubernetes memory quantity to MiB, preserving fractional precision.
+/// Handles: Ki, Mi, Gi, Ti, k, M, G, T, and plain bytes.
+pub fn parse_memory_mib(s: &str) -> f64 {
     let s = s.trim();
     if let Some(v) = s.strip_suffix("Ti") {
-        (v.parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0) as u32
+        v.parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0
     } else if let Some(v) = s.strip_suffix("Gi") {
-        (v.parse::<f64>().unwrap_or(0.0) * 1024.0) as u32
+        v.parse::<f64>().unwrap_or(0.0) * 1024.0
     } else if let Some(v) = s.strip_suffix("Mi") {
-        v.parse().unwrap_or(0)
+        v.parse().unwrap_or(0.0)
     } else if let Some(v) = s.strip_suffix("Ki") {
-        (v.parse::<f64>().unwrap_or(0.0) / 1024.0) as u32
+        v.parse::<f64>().unwrap_or(0.0) / 1024.0
     } else if let Some(v) = s.strip_suffix('T') {
-        (v.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0 / 1_048_576.0) as u32
+        v.parse::<f64>().unwrap_or(0.0) * 1_000_000_000_000.0 / 1_048_576.0
     } else if let Some(v) = s.strip_suffix('G') {
-        (v.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0 / 1_048_576.0) as u32
+        v.parse::<f64>().unwrap_or(0.0) * 1_000_000_000.0 / 1_048_576.0
     } else if let Some(v) = s.strip_suffix('M') {
-        (v.parse::<f64>().unwrap_or(0.0) * 1_000_000.0 / 1_048_576.0) as u32
+        v.parse::<f64>().unwrap_or(0.0) * 1_000_000.0 / 1_048_576.0
     } else if let Some(v) = s.strip_suffix('k') {
-        (v.parse::<f64>().unwrap_or(0.0) * 1_000.0 / 1_048_576.0) as u32
+        v.parse::<f64>().unwrap_or(0.0) * 1_000.0 / 1_048_576.0
     } else {
         // Plain bytes
-        (s.parse::<f64>().unwrap_or(0.0) / 1_048_576.0) as u32
+        s.parse::<f64>().unwrap_or(0.0) / 1_048_576.0
     }
+}
+
+/// Whole millicores, for the `uint32` request/limit fields of the wire schema.
+/// Truncates; a float→int cast in Rust saturates, so negatives clamp to 0.
+pub fn parse_cpu_to_millicores(s: &str) -> u32 {
+    parse_cpu_millicores(s) as u32
+}
+
+/// Whole MiB, for the `uint32` request/limit fields of the wire schema.
+pub fn parse_memory_to_mib(s: &str) -> u32 {
+    parse_memory_mib(s) as u32
 }
 
 pub fn monthly_cost(cpu_m: u32, mem_mi: u32, replicas: u32) -> f64 {
@@ -811,12 +830,12 @@ pub(crate) fn parse_pod_metrics_json(
                             let cpu_m = usage
                                 .get("cpu")
                                 .and_then(|v| v.as_str())
-                                .map(|s| parse_cpu_to_millicores(s) as f64)
+                                .map(parse_cpu_millicores)
                                 .unwrap_or(0.0);
                             let mem_mi = usage
                                 .get("memory")
                                 .and_then(|v| v.as_str())
-                                .map(|s| parse_memory_to_mib(s) as f64)
+                                .map(parse_memory_mib)
                                 .unwrap_or(0.0);
                             Some(ContainerMetric {
                                 name,
@@ -895,10 +914,71 @@ mod tests {
         assert_eq!(parse_memory_to_mib("512Mi"), 512);
         assert_eq!(parse_memory_to_mib("1Gi"), 1024);
         assert_eq!(parse_memory_to_mib("2Gi"), 2048);
-        assert_eq!(parse_memory_to_mib("256Ki"), 0); // rounds down
+        assert_eq!(parse_memory_to_mib("256Ki"), 0); // whole-MiB form truncates
         assert_eq!(parse_memory_to_mib("1073741824"), 1024); // 1 GiB in bytes
         assert_eq!(parse_memory_to_mib("500Mi"), 500);
         assert_eq!(parse_memory_to_mib("4Gi"), 4096);
+    }
+
+    // ── Fractional precision on the usage path ─────────────────────────────────
+    //
+    // Requests/limits are whole numbers on the wire (uint32), but usage is a
+    // double. Truncating usage to an integer reports small containers as idle and
+    // biases every rightsizing recommendation downward, so these pin the
+    // fractional behavior of the parsers the metrics path uses.
+
+    #[test]
+    fn test_parse_cpu_millicores_keeps_sub_millicore_usage() {
+        // metrics-server reports nanocores; 800000n is 0.8m, not "idle".
+        assert!((parse_cpu_millicores("800000n") - 0.8).abs() < 1e-9);
+        assert!((parse_cpu_millicores("100n") - 0.0001).abs() < 1e-9);
+        assert!((parse_cpu_millicores("2500000n") - 2.5).abs() < 1e-9);
+        assert!((parse_cpu_millicores("1500u") - 1.5).abs() < 1e-9);
+        // The integer form still collapses these to zero, which is why the
+        // usage path must not use it.
+        assert_eq!(parse_cpu_to_millicores("800000n"), 0);
+    }
+
+    #[test]
+    fn test_parse_cpu_millicores_matches_integer_form_on_whole_values() {
+        for s in ["500m", "2", "1.5", "0", "1000000000n"] {
+            assert_eq!(
+                parse_cpu_millicores(s) as u32,
+                parse_cpu_to_millicores(s),
+                "mismatch for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_mib_keeps_sub_mib_usage() {
+        assert!((parse_memory_mib("512Ki") - 0.5).abs() < 1e-9);
+        assert!((parse_memory_mib("256Ki") - 0.25).abs() < 1e-9);
+        assert!((parse_memory_mib("1536Ki") - 1.5).abs() < 1e-9);
+        assert_eq!(parse_memory_to_mib("512Ki"), 0);
+    }
+
+    #[test]
+    fn test_parse_memory_decimal_suffixes_scale_correctly() {
+        // Decimal suffixes are powers of 1000; T is 1e12, not 1e9.
+        assert!((parse_memory_mib("1M") - 1_000_000.0 / 1_048_576.0).abs() < 1e-6);
+        assert!((parse_memory_mib("1G") - 1_000_000_000.0 / 1_048_576.0).abs() < 1e-6);
+        assert!((parse_memory_mib("1T") - 1_000_000_000_000.0 / 1_048_576.0).abs() < 1e-3);
+        // 1T must be 1000x 1G, not equal to it.
+        assert!(parse_memory_mib("1T") > parse_memory_mib("1G") * 999.0);
+        // Binary suffixes are powers of 1024.
+        assert_eq!(parse_memory_mib("1Ti"), 1024.0 * 1024.0);
+    }
+
+    #[test]
+    fn test_parsers_reject_garbage_without_panicking() {
+        for s in ["", "abc", "m", "Mi", "-5m", "1e", "  "] {
+            let _ = parse_cpu_millicores(s);
+            let _ = parse_memory_mib(s);
+            // Negative quantities must never wrap around on the uint32 path.
+            assert_eq!(parse_cpu_to_millicores(s), 0, "cpu {s:?}");
+            assert_eq!(parse_memory_to_mib(s), 0, "mem {s:?}");
+        }
     }
 
     #[test]
