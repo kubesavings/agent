@@ -48,6 +48,7 @@ fn snapshot_carries_node_pools_and_region_through_protobuf() {
         collected_at: "2026-06-26T00:00:00+00:00".to_string(),
         region,
         node_pools,
+        agent_version: "1.2.0".to_string(),
     };
 
     // Round-trip through protobuf, exactly as the sender does.
