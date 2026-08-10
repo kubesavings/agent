@@ -24,25 +24,38 @@ agent:
 
   image:
     repository: ghcr.io/kubesavings/agent
-    tag: "1.1.0"
+    tag: "1.2.0"
     pullPolicy: IfNotPresent
 
+  # The agent holds the cluster's pod/workload lists in memory for the duration
+  # of a run, so the ceiling scales with cluster size. 256Mi covers a few
+  # thousand pods; raise it for larger clusters.
   resources:
     requests:
       cpu: 10m
-      memory: 16Mi
-    limits:
-      cpu: 100m
       memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
 
+  # seccompProfile is required by the "restricted" Pod Security Standard —
+  # without it the pod is rejected outright on clusters that enforce it.
   securityContext:
     runAsNonRoot: true
     runAsUser: 65534
+    runAsGroup: 65534
     readOnlyRootFilesystem: true
     allowPrivilegeEscalation: false
+    seccompProfile:
+      type: RuntimeDefault
     capabilities:
       drop:
         - ALL
+
+  # Scheduling controls for clusters where nodes carry taints.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 serviceAccount:
   create: true

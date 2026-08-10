@@ -24,7 +24,7 @@ RUST_LOG=debug cargo run             # run locally (requires KUBES AVINGS_API_KE
 
 The execution flow is strictly linear — `main.rs` calls three modules in sequence:
 
-1. **`config.rs`** — Reads all config from environment variables. `Config::from_env()` validates the endpoint (strips injected paths, rejects non-https except localhost) and the cluster ID (UUID chars only, ≤36 chars). No config file; env-only.
+1. **`config.rs`** — Reads all config from environment variables. `Config::from_env()` validates the endpoint (strips injected paths, rejects non-https except localhost), the cluster ID (UUID chars only, ≤36 chars), and every namespace name (RFC 1123 labels — these are interpolated raw into K8s API request paths). `Debug` is hand-written to redact `api_key`. No config file; env-only.
 
 2. **`collector.rs`** — Queries the live K8s API. Key design points:
    - Resolves pod → workload owner by tracing `ownerReferences`: Pod → ReplicaSet → Deployment (pre-fetches the RS→Deployment map per namespace to avoid per-pod API calls).
@@ -33,7 +33,7 @@ The execution flow is strictly linear — `main.rs` calls three modules in seque
    - Cost estimates use hardcoded rates: `CPU_COST_PER_VCPU_HOUR = $0.048`, `MEM_COST_PER_GB_HOUR = $0.006`. Monthly cost = request-based (not actual usage).
    - Cloud provider auto-detected from node labels (EKS/GKE/AKS) if not set via env.
 
-3. **`sender.rs`** — Encodes `AgentSnapshot` as protobuf and POSTs to `{api_endpoint}/api/clusters/{cluster_id}/snapshot`. Uses exponential backoff (5s → 20s → 80s, capped at 120s, 3 attempts). Returns 401 immediately without retry.
+3. **`sender.rs`** — Encodes `AgentSnapshot` as protobuf and POSTs to `{api_endpoint}/api/clusters/{cluster_id}/snapshot`. Retries only on 408, 429 and 5xx, with exponential backoff (5s → 20s, 3 attempts total, 30s per-attempt timeout). Every other status — 401, 403, 404, 4xx — fails immediately, since no retry can fix them. Worst-case wall clock stays inside the chart's 300s `activeDeadlineSeconds`; `backoff_delays()` is unit-tested against that budget.
 
 4. **`types.rs`** — Re-exports prost-generated types from `OUT_DIR/kubesavings.v1.rs`. Protobuf schema is compiled at build time via `build.rs` and `prost-build`. **Edit the `.proto` file, not the generated code.**
 

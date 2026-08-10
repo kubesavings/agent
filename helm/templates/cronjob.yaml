@@ -22,6 +22,18 @@ spec:
           serviceAccountName: {{ include "kubesavings-agent.serviceAccountName" . }}
           restartPolicy: Never
           automountServiceAccountToken: true
+          {{- with .Values.agent.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.agent.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.agent.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           containers:
             - name: agent
               image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"

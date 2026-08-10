@@ -34,3 +34,52 @@ jobs:
       # bench fails CI too.
       - name: Run tests
         run: cargo test --all-targets --locked
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The image is only built on push to main by release.yml, so without this a
+  # broken Dockerfile is invisible until it reaches main.
+  docker:
+    name: Build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm:
+    name: Lint chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint
+        run: helm lint helm/ --set agent.apiKey=test --set agent.clusterId=test
+
+      # Renders every template so a malformed manifest fails here rather than at
+      # `helm install` time on a user's cluster.
+      - name: Template
+        run: |
+          helm template kubesavings-agent helm/ \
+            --set agent.apiKey=test \
+            --set agent.clusterId=550e8400-e29b-41d4-a716-446655440000 \
+            > /dev/null

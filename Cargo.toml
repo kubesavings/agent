@@ -29,6 +29,7 @@ prost-build = "0.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+wiremock = "0.6.5"
 
 [[bench]]
 name = "collector_bench"

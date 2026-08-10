@@ -20,10 +20,11 @@ FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 
-# Build the actual binary — only re-runs when src/ changes
+# Build the actual binary — only re-runs when src/ changes.
+# --locked keeps the released image reproducible against the committed Cargo.lock.
+# [profile.release] already sets strip = true, so no separate strip step.
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl \
-    && strip target/x86_64-unknown-linux-musl/release/kubesavings-agent
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl
 
 # Stage 2: Minimal image — binary only
 FROM scratch
