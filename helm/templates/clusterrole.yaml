@@ -14,6 +14,20 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
     verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+  # KEDA is optional, so the rule is only granted on clusters that actually serve
+  # the API. .Capabilities reflects the live cluster during install/upgrade; a
+  # bare `helm template` uses a static default set and will omit this rule.
+  {{- if .Capabilities.APIVersions.Has "keda.sh/v1alpha1" }}
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list"]
+  {{- end }}
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods", "nodes"]
     verbs: ["get", "list"]
