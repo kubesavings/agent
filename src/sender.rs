@@ -124,7 +124,7 @@ pub async fn send_snapshot(
 
     let retry_strategy = backoff_delays().map(jitter);
 
-    let result = RetryIf::spawn(
+    let result = RetryIf::start(
         retry_strategy,
         || {
             let client = client.clone();
@@ -288,8 +288,9 @@ mod tests {
     }
 
     /// Protobuf encoding of a `SnapshotResponse` the backend would return.
-    fn ok_response(recommendations: i64, savings: f64) -> Vec<u8> {
+    fn ok_response(recommendations: u32, savings: f64) -> Vec<u8> {
         SnapshotResponse {
+            status: "accepted".to_string(),
             recommendations,
             total_savings_usd: savings,
         }

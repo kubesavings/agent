@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
+use k8s_openapi::jiff::Timestamp;
 use kube::api::ListParams;
 use kube::{Api, Client};
 use serde_json::Value;
@@ -146,8 +147,12 @@ pub fn monthly_cost(cpu_m: u32, mem_mi: u32, replicas: u32) -> f64 {
 }
 
 /// Days elapsed since `ts`, floored to whole days. Returns 0 if ts is in the future.
-fn days_since(ts: &DateTime<Utc>) -> u32 {
-    Utc::now().signed_duration_since(*ts).num_days().max(0) as u32
+///
+/// Takes a `jiff::Timestamp` because that is what `k8s-openapi` wraps in
+/// `metav1::Time` (it moved off `chrono` in 0.28); using the re-export rather
+/// than a direct `jiff` dependency keeps the two in lockstep.
+fn days_since(ts: &Timestamp) -> u32 {
+    (Timestamp::now().duration_since(*ts).as_secs() / 86_400).max(0) as u32
 }
 
 /// Map a node's `spec.providerID` to a canonical cloud-provider name.
@@ -901,6 +906,7 @@ async fn get_target_namespaces(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::jiff::SignedDuration;
 
     #[test]
     fn test_parse_cpu_millicores() {
@@ -987,13 +993,13 @@ mod tests {
 
     #[test]
     fn test_days_since_past() {
-        let ts = Utc::now() - chrono::Duration::days(5);
+        let ts = Timestamp::now() - SignedDuration::from_hours(5 * 24);
         assert_eq!(days_since(&ts), 5);
     }
 
     #[test]
     fn test_days_since_future_clamps_to_zero() {
-        let ts = Utc::now() + chrono::Duration::days(3);
+        let ts = Timestamp::now() + SignedDuration::from_hours(3 * 24);
         assert_eq!(days_since(&ts), 0);
     }
 
