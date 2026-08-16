@@ -60,6 +60,13 @@ message AgentSnapshot {
   string region = 8;                   // primary/most-common cluster region; "" if mixed/unknown
   repeated NodePool node_pools = 9;
   string agent_version = 10;            // kubesavings-agent version (CARGO_PKG_VERSION); "" if unknown
+
+  // True when metrics-server answered this run. The collector degrades to zero
+  // usage when it does not, and every `actual_*` field below defines 0 as both
+  // "measured zero" and "no data" — this is what tells the two apart. Absent
+  // (false) from an older agent, which the backend must treat as "unknown"
+  // rather than "no metrics".
+  bool metrics_available = 11;
 }
 
 message SnapshotResponse {
