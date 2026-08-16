@@ -1,10 +1,10 @@
-//! Kubernetes API compatibility tests across server versions 1.21+.
+//! Kubernetes API compatibility tests across server versions 1.32+.
 //!
 //! The collector consumes live API objects through the `k8s-openapi` typed
-//! models (pinned to the `v1_29` feature). A managed or self-hosted cluster the
-//! agent runs in can be any version from 1.21 upward, so these tests assert that
-//! the exact fields the collector reads still deserialize from the API shapes
-//! those versions emit:
+//! models (pinned to the `v1_32` feature — the oldest `k8s-openapi` 0.28
+//! offers). A managed or self-hosted cluster the agent runs in can be any
+//! version from 1.32 upward, so these tests assert that the exact fields the
+//! collector reads still deserialize from the API shapes those versions emit:
 //!
 //!   * Pod          → `metadata.ownerReferences`, `status.startTime`
 //!   * ReplicaSet   → `metadata.ownerReferences` (Deployment parent)
@@ -16,7 +16,7 @@
 //!   * Event        → `lastTimestamp`
 //!
 //! The apps/v1 and core/v1 schemas for these objects have been GA and stable
-//! since long before 1.21, so the per-version loops act as regression guards: if
+//! since long before 1.32, so the per-version loops act as regression guards: if
 //! a future `k8s-openapi` bump ever changed how a field deserializes, every
 //! supported version would fail loudly here.
 
@@ -25,7 +25,7 @@ use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use serde_json::{json, Value};
 
 /// Every server minor version the agent is expected to support.
-const SUPPORTED_MINORS: std::ops::RangeInclusive<u32> = 21..=31;
+const SUPPORTED_MINORS: std::ops::RangeInclusive<u32> = 32..=36;
 
 /// `gitVersion` string as a cluster of the given minor would report it.
 fn git_version(minor: u32) -> String {
@@ -91,7 +91,7 @@ fn pod_owner_reference_and_start_time_parse_across_versions() {
             .as_ref()
             .and_then(|s| s.start_time.as_ref())
             .unwrap_or_else(|| panic!("1.{minor}: missing status.startTime"));
-        assert_eq!(start.0.to_rfc3339(), "2024-01-02T03:04:05+00:00");
+        assert_eq!(start.0.to_string(), "2024-01-02T03:04:05Z");
     }
 }
 
@@ -291,7 +291,7 @@ fn node_cloud_provider_labels_parse_across_providers() {
                     label_key: label_val
                 }
             },
-            "status": { "nodeInfo": { "kubeletVersion": "v1.29.0" } }
+            "status": { "nodeInfo": { "kubeletVersion": "v1.32.0" } }
         });
 
         let node: Node =
@@ -340,7 +340,7 @@ fn event_last_timestamp_parses_across_versions() {
         let event: Event =
             serde_json::from_value(value).unwrap_or_else(|e| panic!("1.{minor} event failed: {e}"));
         let ts = event.last_timestamp.expect("lastTimestamp");
-        assert_eq!(ts.0.to_rfc3339(), "2024-05-01T12:05:00+00:00");
+        assert_eq!(ts.0.to_string(), "2024-05-01T12:05:00Z");
     }
 }
 

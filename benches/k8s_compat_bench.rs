@@ -9,15 +9,16 @@
 //! the collector consumes, plus the public quantity parsers — mirroring what the
 //! collector actually does per object.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Pod;
 use serde_json::{json, Value};
+use std::hint::black_box;
 
 use kubesavings_agent::collector::{parse_cpu_to_millicores, parse_memory_to_mib};
 
 /// Server minors the agent supports; benched at the endpoints and middle.
-const VERSIONS: &[u32] = &[21, 26, 31];
+const VERSIONS: &[u32] = &[32, 34, 36];
 
 fn pod_json(minor: u32) -> String {
     json!({
