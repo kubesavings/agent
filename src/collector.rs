@@ -2,13 +2,15 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
+use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use k8s_openapi::jiff::Timestamp;
-use kube::api::ListParams;
+use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams};
 use kube::{Api, Client};
 use serde_json::Value;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::types::{AgentSnapshot, NamespaceMetrics, NodePool, WorkloadMetrics};
@@ -287,6 +289,211 @@ pub fn aggregate_node_pools(nodes: &[Node]) -> (Vec<NodePool>, String, String) {
     (node_pools, region, provider)
 }
 
+/// Autoscaler context for one workload, as the wire schema's optional fields
+/// expect it. Defaults are the proto zero-values, which the backend reads as
+/// "no autoscaler present".
+#[derive(Default)]
+pub(crate) struct AutoscalerContext {
+    has_hpa: bool,
+    hpa_min_replicas: u32,
+    hpa_max_replicas: u32,
+    hpa_target_cpu_pct: u32,
+    hpa_current_replicas: u32,
+    keda_scaled: bool,
+    keda_min_replicas: u32,
+    keda_trigger_types: String,
+}
+
+/// Key: (workload_type, workload_name) within one namespace — the same pair a
+/// `scaleTargetRef` names.
+type AutoscalerMap = HashMap<(String, String), AutoscalerContext>;
+
+/// Copy a workload's autoscaler context onto its wire metrics. A workload with
+/// no HPA and no ScaledObject keeps the proto zero-values.
+fn apply_autoscaler_context(wl: &mut WorkloadMetrics, ctx: Option<&AutoscalerContext>) {
+    let Some(ctx) = ctx else {
+        return;
+    };
+    wl.has_hpa = ctx.has_hpa;
+    wl.hpa_min_replicas = ctx.hpa_min_replicas;
+    wl.hpa_max_replicas = ctx.hpa_max_replicas;
+    wl.hpa_target_cpu_pct = ctx.hpa_target_cpu_pct;
+    wl.hpa_current_replicas = ctx.hpa_current_replicas;
+    wl.keda_scaled = ctx.keda_scaled;
+    wl.keda_min_replicas = ctx.keda_min_replicas;
+    wl.keda_trigger_types = ctx.keda_trigger_types.clone();
+}
+
+/// Render a Kubernetes timestamp as the backend parses it: RFC3339, whole
+/// seconds, `Z` suffix.
+///
+/// `Timestamp`'s own `Display` can emit fractional seconds, and the backend
+/// parses with Python's `datetime.fromisoformat`, which rejects more than six
+/// fractional digits. Formatting explicitly keeps that from ever mattering.
+fn format_rfc3339(ts: &Timestamp) -> String {
+    ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Non-negative `i32` → `u32`, clamping negatives (which the API never sends) to 0.
+fn to_u32(v: i32) -> u32 {
+    v.max(0) as u32
+}
+
+/// Build the per-namespace autoscaler map from HorizontalPodAutoscalers and KEDA
+/// ScaledObjects.
+///
+/// Both are optional: a cluster with no HPAs, or without KEDA's CRD installed,
+/// yields an empty map rather than an error. A KEDA-scaled workload also carries
+/// an operator-managed HPA, so it legitimately reports both `has_hpa` and
+/// `keda_scaled`.
+async fn fetch_autoscaler_context(client: &Client, ns: &str) -> AutoscalerMap {
+    let mut map: AutoscalerMap = HashMap::new();
+
+    let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), ns);
+    match hpas.list(&ListParams::default()).await {
+        Ok(list) => {
+            for hpa in &list.items {
+                if let Some(f) = hpa_fields(hpa) {
+                    let entry = map.entry((f.kind, f.name)).or_default();
+                    entry.has_hpa = true;
+                    entry.hpa_min_replicas = f.min_replicas;
+                    entry.hpa_max_replicas = f.max_replicas;
+                    entry.hpa_target_cpu_pct = f.target_cpu_pct;
+                    entry.hpa_current_replicas = f.current_replicas;
+                }
+            }
+        }
+        Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_hpas"),
+    }
+
+    // KEDA is a CRD most clusters do not have. Its absence is a 404 from the
+    // apiserver, which is expected — log at debug and move on, so a missing CRD
+    // never looks like a collection failure.
+    let gvk = GroupVersionKind::gvk("keda.sh", "v1alpha1", "ScaledObject");
+    let scaled_objects: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), ns, &ApiResource::from_gvk(&gvk));
+    match scaled_objects.list(&ListParams::default()).await {
+        Ok(list) => {
+            for so in &list.items {
+                if let Some(f) = keda_fields(&so.data["spec"]) {
+                    let entry = map.entry((f.kind, f.name)).or_default();
+                    entry.keda_scaled = true;
+                    entry.keda_min_replicas = f.min_replicas;
+                    entry.keda_trigger_types = f.trigger_types;
+                }
+            }
+        }
+        Err(e) => debug!(namespace = %ns, error = %e, "keda_scaledobjects_unavailable"),
+    }
+
+    map
+}
+
+/// The HPA fields the wire schema carries, plus the target it scales.
+pub(crate) struct HpaFields {
+    kind: String,
+    name: String,
+    min_replicas: u32,
+    max_replicas: u32,
+    target_cpu_pct: u32,
+    current_replicas: u32,
+}
+
+/// Extract an HPA's scale target and limits. `None` if it names no target.
+fn hpa_fields(hpa: &HorizontalPodAutoscaler) -> Option<HpaFields> {
+    let spec = hpa.spec.as_ref()?;
+    let target = &spec.scale_target_ref;
+    if target.name.is_empty() {
+        return None;
+    }
+    // The CPU target lives in the Resource metric naming "cpu"; other metric
+    // types (memory, external, custom) have no field in the wire schema and
+    // leave the percentage at 0.
+    let target_cpu_pct = spec
+        .metrics
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.resource.as_ref())
+        .find(|r| r.name.eq_ignore_ascii_case("cpu"))
+        .and_then(|r| r.target.average_utilization)
+        .map(to_u32)
+        .unwrap_or(0);
+
+    Some(HpaFields {
+        kind: target.kind.clone(),
+        name: target.name.clone(),
+        min_replicas: spec.min_replicas.map(to_u32).unwrap_or(0),
+        max_replicas: to_u32(spec.max_replicas),
+        target_cpu_pct,
+        current_replicas: hpa
+            .status
+            .as_ref()
+            .and_then(|s| s.current_replicas)
+            .map(to_u32)
+            .unwrap_or(0),
+    })
+}
+
+/// The KEDA fields the wire schema carries, plus the target it scales.
+pub(crate) struct KedaFields {
+    kind: String,
+    name: String,
+    min_replicas: u32,
+    trigger_types: String,
+}
+
+/// Extract a ScaledObject's target and floor from its untyped `spec`.
+/// `None` if it names no target.
+fn keda_fields(spec: &Value) -> Option<KedaFields> {
+    let name = spec["scaleTargetRef"]["name"].as_str()?;
+    let trigger_types: Vec<&str> = spec["triggers"]
+        .as_array()
+        .map(|ts| ts.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| t["type"].as_str())
+        .collect();
+
+    Some(KedaFields {
+        // KEDA defaults scaleTargetRef.kind to Deployment when omitted.
+        kind: spec["scaleTargetRef"]["kind"]
+            .as_str()
+            .unwrap_or("Deployment")
+            .to_string(),
+        name: name.to_string(),
+        min_replicas: spec["minReplicaCount"].as_i64().unwrap_or(0).max(0) as u32,
+        trigger_types: trigger_types.join(","),
+    })
+}
+
+/// Count failed Jobs per owning CronJob name.
+///
+/// Only the Jobs the apiserver still holds are visible, and a CronJob's history
+/// limits (3 failed by default) bound that to recent runs — which is exactly the
+/// "recent failures" the wire schema asks for.
+async fn fetch_cronjob_failures(client: &Client, ns: &str) -> HashMap<String, u32> {
+    let mut failures: HashMap<String, u32> = HashMap::new();
+    let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+    match jobs.list(&ListParams::default()).await {
+        Ok(list) => {
+            for job in list.items {
+                let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+                if failed <= 0 {
+                    continue;
+                }
+                for owner in job.metadata.owner_references.iter().flatten() {
+                    if owner.kind == "CronJob" {
+                        *failures.entry(owner.name.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_jobs"),
+    }
+    failures
+}
+
 pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
     let client = Client::try_default().await?;
 
@@ -349,6 +556,10 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
         let mut ns_workload_count = 0u32;
         let mut ns_cost = 0.0f64;
 
+        // HPA/KEDA context for this namespace, keyed by the (kind, name) pair a
+        // scaleTargetRef names. Fetched once per namespace rather than per workload.
+        let autoscalers = fetch_autoscaler_context(&client, ns).await;
+
         // Deployments
         let deployments: Api<Deployment> = Api::namespaced(client.clone(), ns);
         match deployments.list(&ListParams::default()).await {
@@ -362,6 +573,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                         .as_ref()
                         .map(|ts| days_since(&ts.0))
                         .unwrap_or(0);
+                    let ctx = autoscalers.get(&("Deployment".to_string(), name.clone()));
 
                     for container in dep
                         .spec
@@ -376,7 +588,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             name.clone(),
                             container.name.clone(),
                         );
-                        let wl = build_workload_metrics(
+                        let mut wl = build_workload_metrics(
                             ns,
                             "Deployment",
                             &name,
@@ -386,6 +598,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             &container.resources,
                             usage_map.get(&usage_key),
                         );
+                        apply_autoscaler_context(&mut wl, ctx);
                         ns_cost += wl.estimated_monthly_cost_usd;
                         workloads.push(wl);
                     }
@@ -408,6 +621,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                         .as_ref()
                         .map(|ts| days_since(&ts.0))
                         .unwrap_or(0);
+                    let ctx = autoscalers.get(&("StatefulSet".to_string(), name.clone()));
 
                     for container in sts
                         .spec
@@ -422,7 +636,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             name.clone(),
                             container.name.clone(),
                         );
-                        let wl = build_workload_metrics(
+                        let mut wl = build_workload_metrics(
                             ns,
                             "StatefulSet",
                             &name,
@@ -432,6 +646,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             &container.resources,
                             usage_map.get(&usage_key),
                         );
+                        apply_autoscaler_context(&mut wl, ctx);
                         ns_cost += wl.estimated_monthly_cost_usd;
                         workloads.push(wl);
                     }
@@ -484,6 +699,66 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                 }
             }
             Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_daemonsets"),
+        }
+
+        // CronJobs. Emitted so the backend can see suspended/failing schedules and
+        // missing limits; their requests are deliberately kept out of `ns_cost`,
+        // since a CronJob reserves capacity only while a run is in flight and
+        // billing it for the whole month would inflate the namespace's cost (and
+        // with it the zombie-namespace saving derived from it).
+        let cronjobs: Api<CronJob> = Api::namespaced(client.clone(), ns);
+        match cronjobs.list(&ListParams::default()).await {
+            Ok(cj_list) => {
+                let failures = if cj_list.items.is_empty() {
+                    HashMap::new()
+                } else {
+                    fetch_cronjob_failures(&client, ns).await
+                };
+
+                for cj in cj_list.items {
+                    let name = cj.metadata.name.clone().unwrap_or_default();
+                    let obs_days = cj
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|ts| days_since(&ts.0))
+                        .unwrap_or(0);
+                    let spec = cj.spec.as_ref();
+                    let suspended = spec.and_then(|s| s.suspend).unwrap_or(false);
+                    let last_schedule = cj
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.last_schedule_time.as_ref())
+                        .map(|t| format_rfc3339(&t.0))
+                        .unwrap_or_default();
+                    let recent_failures = failures.get(&name).copied().unwrap_or(0);
+
+                    for container in spec
+                        .and_then(|s| s.job_template.spec.as_ref())
+                        .and_then(|js| js.template.spec.as_ref())
+                        .map(|ps| ps.containers.as_slice())
+                        .unwrap_or_default()
+                    {
+                        // A CronJob has no steady-state replicas; one run at a time.
+                        let mut wl = build_workload_metrics(
+                            ns,
+                            "CronJob",
+                            &name,
+                            &container.name,
+                            1,
+                            obs_days,
+                            &container.resources,
+                            None,
+                        );
+                        wl.cronjob_suspended = suspended;
+                        wl.cronjob_last_schedule_ts = last_schedule.clone();
+                        wl.cronjob_recent_failures = recent_failures;
+                        workloads.push(wl);
+                    }
+                    ns_workload_count += 1;
+                }
+            }
+            Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_cronjobs"),
         }
 
         namespace_workload_counts.insert(ns.clone(), ns_workload_count);
@@ -989,6 +1264,132 @@ mod tests {
             assert_eq!(parse_cpu_to_millicores(s), 0, "cpu {s:?}");
             assert_eq!(parse_memory_to_mib(s), 0, "mem {s:?}");
         }
+    }
+
+    // ── Autoscaler context ─────────────────────────────────────────────────
+    //
+    // These parse the API shapes the collector reads. The three categories they
+    // feed (hpa-misconfig, cronjob-waste, keda-idle) are gated behind
+    // has_hpa/keda_scaled, so a silent parse regression turns them all off with
+    // no error anywhere — exactly the failure these guard against.
+
+    #[test]
+    fn hpa_fields_extracts_target_and_cpu_percentage() {
+        let hpa: HorizontalPodAutoscaler = serde_json::from_value(serde_json::json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": { "name": "api" },
+            "spec": {
+                "scaleTargetRef": { "apiVersion": "apps/v1", "kind": "Deployment", "name": "api" },
+                "minReplicas": 3,
+                "maxReplicas": 10,
+                "metrics": [
+                    // A non-CPU metric first, to pin that the CPU one is still found.
+                    { "type": "Resource", "resource": { "name": "memory",
+                        "target": { "type": "Utilization", "averageUtilization": 90 } } },
+                    { "type": "Resource", "resource": { "name": "cpu",
+                        "target": { "type": "Utilization", "averageUtilization": 75 } } }
+                ]
+            },
+            "status": { "currentReplicas": 3, "desiredReplicas": 3 }
+        }))
+        .expect("HPA fixture should deserialize");
+
+        let f = hpa_fields(&hpa).expect("HPA names a target");
+        assert_eq!(f.kind, "Deployment");
+        assert_eq!(f.name, "api");
+        assert_eq!(f.min_replicas, 3);
+        assert_eq!(f.max_replicas, 10);
+        assert_eq!(f.target_cpu_pct, 75);
+        assert_eq!(f.current_replicas, 3);
+    }
+
+    #[test]
+    fn hpa_without_cpu_metric_reports_zero_percent_not_a_wrong_one() {
+        let hpa: HorizontalPodAutoscaler = serde_json::from_value(serde_json::json!({
+            "spec": {
+                "scaleTargetRef": { "kind": "StatefulSet", "name": "queue" },
+                "maxReplicas": 5,
+                "metrics": [
+                    { "type": "External", "external": { "metric": { "name": "lag" },
+                        "target": { "type": "AverageValue", "averageValue": "100" } } }
+                ]
+            }
+        }))
+        .expect("HPA fixture should deserialize");
+
+        let f = hpa_fields(&hpa).expect("HPA names a target");
+        assert_eq!(f.target_cpu_pct, 0);
+        // minReplicas omitted — the wire schema's "not present" is 0, not 1.
+        assert_eq!(f.min_replicas, 0);
+        assert_eq!(f.kind, "StatefulSet");
+    }
+
+    #[test]
+    fn keda_fields_defaults_kind_to_deployment_and_joins_triggers() {
+        let spec = serde_json::json!({
+            "scaleTargetRef": { "name": "consumer" },
+            "minReplicaCount": 2,
+            "triggers": [ { "type": "kafka" }, { "type": "cron" } ]
+        });
+
+        let f = keda_fields(&spec).expect("ScaledObject names a target");
+        assert_eq!(f.kind, "Deployment");
+        assert_eq!(f.name, "consumer");
+        assert_eq!(f.min_replicas, 2);
+        assert_eq!(f.trigger_types, "kafka,cron");
+    }
+
+    #[test]
+    fn keda_fields_tolerates_a_spec_with_nothing_in_it() {
+        assert!(keda_fields(&serde_json::json!({})).is_none());
+        // Present target, everything else missing: floor 0, no triggers.
+        let f = keda_fields(&serde_json::json!({ "scaleTargetRef": { "name": "w" } }))
+            .expect("target named");
+        assert_eq!(f.min_replicas, 0);
+        assert_eq!(f.trigger_types, "");
+    }
+
+    #[test]
+    fn autoscaler_context_left_absent_keeps_proto_zero_values() {
+        let mut wl = WorkloadMetrics::default();
+        apply_autoscaler_context(&mut wl, None);
+        assert!(!wl.has_hpa);
+        assert!(!wl.keda_scaled);
+        assert_eq!(wl.hpa_min_replicas, 0);
+        assert_eq!(wl.keda_trigger_types, "");
+    }
+
+    #[test]
+    fn a_keda_scaled_workload_reports_both_hpa_and_keda() {
+        // KEDA creates an operator-managed HPA, so both flags are legitimately set.
+        let ctx = AutoscalerContext {
+            has_hpa: true,
+            hpa_min_replicas: 1,
+            hpa_max_replicas: 20,
+            hpa_target_cpu_pct: 70,
+            hpa_current_replicas: 1,
+            keda_scaled: true,
+            keda_min_replicas: 1,
+            keda_trigger_types: "kafka".to_string(),
+        };
+        let mut wl = WorkloadMetrics::default();
+        apply_autoscaler_context(&mut wl, Some(&ctx));
+
+        assert!(wl.has_hpa && wl.keda_scaled);
+        assert_eq!(wl.hpa_max_replicas, 20);
+        assert_eq!(wl.keda_min_replicas, 1);
+        assert_eq!(wl.keda_trigger_types, "kafka");
+    }
+
+    #[test]
+    fn cronjob_timestamps_are_whole_seconds_the_backend_can_parse() {
+        // The backend parses this with Python's datetime.fromisoformat, which
+        // rejects more than six fractional digits — so emit none at all.
+        let ts: Timestamp = "2024-05-01T12:05:00.123456789Z"
+            .parse()
+            .expect("timestamp parses");
+        assert_eq!(format_rfc3339(&ts), "2024-05-01T12:05:00Z");
     }
 
     #[test]
