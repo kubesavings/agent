@@ -538,7 +538,10 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 
     // Collect instantaneous pod metrics from the metrics-server.
     // Key: (namespace, pod_name) → Vec<ContainerMetric>
-    let pod_metrics = fetch_pod_metrics(&client).await;
+    let (pod_metrics, metrics_available) = match fetch_pod_metrics(&client).await {
+        Some(m) => (m, true),
+        None => (HashMap::new(), false),
+    };
 
     // Build pod → workload owner map (resolves ReplicaSet → Deployment).
     // Also returns the most-recent pod start time per namespace for activity tracking.
@@ -809,6 +812,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
         region,
         node_pools,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        metrics_available,
     })
 }
 
@@ -1054,7 +1058,15 @@ async fn fetch_namespace_last_activity_from_events(client: &Client, ns: &str) ->
 
 /// Fetch current pod metrics from the metrics-server API.
 /// Returns a map of (namespace, pod_name) → Vec<ContainerMetric>.
-async fn fetch_pod_metrics(client: &Client) -> HashMap<(String, String), Vec<ContainerMetric>> {
+/// `None` means metrics-server did not answer; `Some(map)` means it did, even if
+/// the map is empty (a cluster can legitimately have no running pods).
+///
+/// The distinction matters downstream: the wire schema defines a `0` usage value
+/// as both "measured zero" and "no data", so without this the backend cannot tell
+/// an idle cluster from one with no metrics-server installed.
+async fn fetch_pod_metrics(
+    client: &Client,
+) -> Option<HashMap<(String, String), Vec<ContainerMetric>>> {
     let req = match http::Request::builder()
         .uri("/apis/metrics.k8s.io/v1beta1/pods")
         .body(vec![])
@@ -1062,15 +1074,15 @@ async fn fetch_pod_metrics(client: &Client) -> HashMap<(String, String), Vec<Con
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "failed_to_build_metrics_request");
-            return HashMap::new();
+            return None;
         }
     };
 
     match client.request::<Value>(req).await {
-        Ok(val) => parse_pod_metrics_json(&val),
+        Ok(val) => Some(parse_pod_metrics_json(&val)),
         Err(e) => {
             warn!(error = %e, "metrics_server_unavailable_continuing_without_usage_data");
-            HashMap::new()
+            None
         }
     }
 }
@@ -1380,6 +1392,24 @@ mod tests {
         assert_eq!(wl.hpa_max_replicas, 20);
         assert_eq!(wl.keda_min_replicas, 1);
         assert_eq!(wl.keda_trigger_types, "kafka");
+    }
+
+    #[test]
+    fn an_empty_metrics_response_is_not_the_same_as_no_metrics_server() {
+        // metrics-server answering with zero pods is a real, empty result; the
+        // caller distinguishes it from a failed call by Some(empty) vs None. If
+        // these ever collapse back into one value, the backend loses its only way
+        // to tell an idle cluster from one without metrics-server.
+        let empty = parse_pod_metrics_json(&serde_json::json!({ "items": [] }));
+        assert!(empty.is_empty());
+
+        let populated = parse_pod_metrics_json(&serde_json::json!({
+            "items": [{
+                "metadata": { "namespace": "default", "name": "api-0" },
+                "containers": [{ "name": "main", "usage": { "cpu": "250m", "memory": "128Mi" } }]
+            }]
+        }));
+        assert_eq!(populated.len(), 1);
     }
 
     #[test]
