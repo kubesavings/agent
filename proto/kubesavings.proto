@@ -63,6 +63,20 @@ message NodePool {
   string region        = 2;   // e.g. "us-east-1"; "" if unknown
   string capacity_type = 3;   // "on-demand" | "spot" | ""
   uint32 node_count    = 4;   // nodes in this group
+
+  // Capacity of a SINGLE node in this pool, not the pool total. A pool is keyed
+  // by (instance_type, region, capacity_type) and is therefore homogeneous, so
+  // one node's figures times node_count give the pool. Averaged across the pool's
+  // nodes, which only differ if the cluster is mid-upgrade.
+  //
+  // `allocatable` is what schedulers can actually place pods into — capacity minus
+  // kubelet/system reservations and eviction thresholds — so it, not `capacity`,
+  // is the denominator for any packing calculation. Both are 0 if the node status
+  // did not report them.
+  uint32 cpu_allocatable_m     = 5;
+  uint32 memory_allocatable_mi = 6;
+  uint32 cpu_capacity_m        = 7;
+  uint32 memory_capacity_mi    = 8;
 }
 
 message AgentSnapshot {
