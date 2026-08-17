@@ -5,6 +5,8 @@ use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet}
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams};
 use kube::{Api, Client};
@@ -38,6 +40,22 @@ struct PodOwner {
     workload_type: String,
     workload_name: String,
 }
+
+/// Per-workload signals that say whether shrinking its requests is safe.
+///
+/// Aggregated across the workload's pods in the same pass that resolves owners,
+/// so this costs no extra API calls.
+#[derive(Default)]
+pub(crate) struct WorkloadHealth {
+    restart_count: u32,
+    oom_killed_count: u32,
+    qos_class: String,
+    has_pdb: bool,
+    pdb_min_available: u32,
+}
+
+/// Key: (namespace, workload_type, workload_name).
+type HealthMap = HashMap<(String, String, String), WorkloadHealth>;
 
 /// Per-container usage from the metrics-server (instantaneous, current values).
 pub(crate) struct ContainerMetric {
@@ -308,6 +326,20 @@ pub(crate) struct AutoscalerContext {
 /// `scaleTargetRef` names.
 type AutoscalerMap = HashMap<(String, String), AutoscalerContext>;
 
+/// Copy a workload's right-sizing guardrails onto its wire metrics. A workload
+/// whose pods were never seen keeps the proto zero-values, which the backend
+/// reads as "no signal" rather than "safe to shrink".
+fn apply_workload_health(wl: &mut WorkloadMetrics, health: Option<&WorkloadHealth>) {
+    let Some(h) = health else {
+        return;
+    };
+    wl.restart_count = h.restart_count;
+    wl.oom_killed_count = h.oom_killed_count;
+    wl.qos_class = h.qos_class.clone();
+    wl.has_pdb = h.has_pdb;
+    wl.pdb_min_available = h.pdb_min_available;
+}
+
 /// Copy a workload's autoscaler context onto its wire metrics. A workload with
 /// no HPA and no ScaledObject keeps the proto zero-values.
 fn apply_autoscaler_context(wl: &mut WorkloadMetrics, ctx: Option<&AutoscalerContext>) {
@@ -545,7 +577,8 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 
     // Build pod → workload owner map (resolves ReplicaSet → Deployment).
     // Also returns the most-recent pod start time per namespace for activity tracking.
-    let (pod_owner_map, pod_activity) = build_pod_owner_map(&client, &target_namespaces).await;
+    let (pod_owner_map, pod_activity, workload_health) =
+        build_pod_owner_map(&client, &target_namespaces).await;
 
     // Aggregate pod metrics into per-(workload, container) usage totals
     let usage_map = aggregate_workload_usage(&pod_metrics, &pod_owner_map);
@@ -577,6 +610,8 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                         .map(|ts| days_since(&ts.0))
                         .unwrap_or(0);
                     let ctx = autoscalers.get(&("Deployment".to_string(), name.clone()));
+                    let health =
+                        workload_health.get(&(ns.clone(), "Deployment".to_string(), name.clone()));
 
                     for container in dep
                         .spec
@@ -602,6 +637,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             usage_map.get(&usage_key),
                         );
                         apply_autoscaler_context(&mut wl, ctx);
+                        apply_workload_health(&mut wl, health);
                         ns_cost += wl.estimated_monthly_cost_usd;
                         workloads.push(wl);
                     }
@@ -625,6 +661,8 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                         .map(|ts| days_since(&ts.0))
                         .unwrap_or(0);
                     let ctx = autoscalers.get(&("StatefulSet".to_string(), name.clone()));
+                    let health =
+                        workload_health.get(&(ns.clone(), "StatefulSet".to_string(), name.clone()));
 
                     for container in sts
                         .spec
@@ -650,6 +688,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             usage_map.get(&usage_key),
                         );
                         apply_autoscaler_context(&mut wl, ctx);
+                        apply_workload_health(&mut wl, health);
                         ns_cost += wl.estimated_monthly_cost_usd;
                         workloads.push(wl);
                     }
@@ -671,6 +710,8 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                         .as_ref()
                         .map(|ts| days_since(&ts.0))
                         .unwrap_or(0);
+                    let health =
+                        workload_health.get(&(ns.clone(), "DaemonSet".to_string(), name.clone()));
 
                     for container in ds
                         .spec
@@ -685,7 +726,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             name.clone(),
                             container.name.clone(),
                         );
-                        let wl = build_workload_metrics(
+                        let mut wl = build_workload_metrics(
                             ns,
                             "DaemonSet",
                             &name,
@@ -695,6 +736,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                             &container.resources,
                             usage_map.get(&usage_key),
                         );
+                        apply_workload_health(&mut wl, health);
                         ns_cost += wl.estimated_monthly_cost_usd;
                         workloads.push(wl);
                     }
@@ -823,9 +865,14 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 async fn build_pod_owner_map(
     client: &Client,
     namespaces: &[String],
-) -> (HashMap<(String, String), PodOwner>, HashMap<String, u32>) {
+) -> (
+    HashMap<(String, String), PodOwner>,
+    HashMap<String, u32>,
+    HealthMap,
+) {
     let mut owner_map: HashMap<(String, String), PodOwner> = HashMap::new();
     let mut pod_activity: HashMap<String, u32> = HashMap::new();
+    let mut health: HealthMap = HashMap::new();
 
     for ns in namespaces {
         // Pre-fetch ReplicaSet → Deployment mapping to avoid per-pod API calls
@@ -854,6 +901,10 @@ async fn build_pod_owner_map(
                 }
             }
         };
+
+        // PodDisruptionBudgets guarding pods in this namespace, reduced to the
+        // (matchLabels, minAvailable) pairs the guardrail needs.
+        let pdbs = fetch_pdbs(client, ns).await;
 
         let pods_api: Api<Pod> = Api::namespaced(client.clone(), ns);
         match pods_api.list(&ListParams::default()).await {
@@ -907,6 +958,36 @@ async fn build_pod_owner_map(
                         });
 
                     if let Some(o) = owner {
+                        // Accumulate the workload's health from this pod before the
+                        // owner is moved into the map.
+                        let key = (ns.clone(), o.workload_type.clone(), o.workload_name.clone());
+                        let entry = health.entry(key).or_default();
+                        if let Some(status) = pod.status.as_ref() {
+                            for cs in status.container_statuses.iter().flatten() {
+                                entry.restart_count += to_u32(cs.restart_count);
+                                // `last_state.terminated` is the *previous* run, which is
+                                // where an OOMKill shows up once the container restarted.
+                                let oom = cs
+                                    .last_state
+                                    .as_ref()
+                                    .and_then(|s| s.terminated.as_ref())
+                                    .and_then(|t| t.reason.as_deref())
+                                    .is_some_and(|r| r == "OOMKilled");
+                                if oom {
+                                    entry.oom_killed_count += 1;
+                                }
+                            }
+                            if entry.qos_class.is_empty() {
+                                if let Some(q) = status.qos_class.as_deref() {
+                                    entry.qos_class = q.to_string();
+                                }
+                            }
+                        }
+                        if let Some(min) = pdb_floor(&pdbs, pod.metadata.labels.as_ref()) {
+                            entry.has_pdb = true;
+                            entry.pdb_min_available = entry.pdb_min_available.max(min);
+                        }
+
                         owner_map.insert((ns.clone(), pod_name), o);
                     }
                 }
@@ -919,7 +1000,57 @@ async fn build_pod_owner_map(
         }
     }
 
-    (owner_map, pod_activity)
+    (owner_map, pod_activity, health)
+}
+
+/// A namespace's PodDisruptionBudgets as (matchLabels, minAvailable) pairs.
+///
+/// Only `spec.selector.matchLabels` is honoured — `matchExpressions` is vanishingly
+/// rare on PDBs and supporting it would mean reimplementing selector evaluation for
+/// a guardrail whose question is "is this workload guarded at all". A PDB using only
+/// `matchExpressions` therefore selects nothing here and its workloads keep
+/// `has_pdb = false`, which degrades to today's behaviour rather than misreporting.
+///
+/// `minAvailable` expressed as a percentage yields 0: `has_pdb` is the flag that
+/// says the workload is guarded, the count is supplementary.
+async fn fetch_pdbs(client: &Client, ns: &str) -> Vec<(BTreeMap<String, String>, u32)> {
+    let api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), ns);
+    match api.list(&ListParams::default()).await {
+        Ok(list) => list
+            .items
+            .into_iter()
+            .filter_map(|pdb| {
+                let spec = pdb.spec?;
+                let labels = spec.selector?.match_labels?;
+                if labels.is_empty() {
+                    return None;
+                }
+                let min = match spec.min_available {
+                    Some(IntOrString::Int(n)) => to_u32(n),
+                    _ => 0,
+                };
+                Some((labels, min))
+            })
+            .collect(),
+        Err(e) => {
+            warn!(namespace = %ns, error = %e, "failed_to_list_poddisruptionbudgets");
+            Vec::new()
+        }
+    }
+}
+
+/// The largest `minAvailable` among the PDBs selecting these pod labels, or `None`
+/// when no PDB selects them. A PDB selects a pod when every one of its matchLabels
+/// is present on the pod with the same value.
+fn pdb_floor(
+    pdbs: &[(BTreeMap<String, String>, u32)],
+    pod_labels: Option<&BTreeMap<String, String>>,
+) -> Option<u32> {
+    let pod_labels = pod_labels?;
+    pdbs.iter()
+        .filter(|(selector, _)| selector.iter().all(|(k, v)| pod_labels.get(k) == Some(v)))
+        .map(|(_, min)| *min)
+        .max()
 }
 
 /// Aggregate per-container pod metrics into per-(workload, container) usage totals.
@@ -1392,6 +1523,93 @@ mod tests {
         assert_eq!(wl.hpa_max_replicas, 20);
         assert_eq!(wl.keda_min_replicas, 1);
         assert_eq!(wl.keda_trigger_types, "kafka");
+    }
+
+    // ── Right-sizing guardrails ────────────────────────────────────────────
+
+    fn pdb(pairs: &[(&str, &str)], min: u32) -> (BTreeMap<String, String>, u32) {
+        (
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            min,
+        )
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn pdb_selects_a_pod_only_when_every_match_label_agrees() {
+        let pdbs = vec![pdb(&[("app", "api"), ("tier", "web")], 2)];
+
+        // All selector labels present with matching values.
+        let pod = labels(&[("app", "api"), ("tier", "web"), ("extra", "ignored")]);
+        assert_eq!(pdb_floor(&pdbs, Some(&pod)), Some(2));
+
+        // One label missing — a PDB requiring both must not select this pod.
+        let partial = labels(&[("app", "api")]);
+        assert_eq!(pdb_floor(&pdbs, Some(&partial)), None);
+
+        // Present but different value.
+        let wrong = labels(&[("app", "api"), ("tier", "batch")]);
+        assert_eq!(pdb_floor(&pdbs, Some(&wrong)), None);
+    }
+
+    #[test]
+    fn pdb_floor_takes_the_strictest_of_several_matching_budgets() {
+        let pdbs = vec![pdb(&[("app", "api")], 1), pdb(&[("app", "api")], 4)];
+        let pod = labels(&[("app", "api")]);
+        assert_eq!(pdb_floor(&pdbs, Some(&pod)), Some(4));
+    }
+
+    #[test]
+    fn a_percentage_pdb_still_marks_the_workload_guarded() {
+        // fetch_pdbs maps a percentage minAvailable to 0; the caller sets has_pdb
+        // from the Some(_), so the workload is still known to be guarded.
+        let pdbs = vec![pdb(&[("app", "api")], 0)];
+        let pod = labels(&[("app", "api")]);
+        assert_eq!(pdb_floor(&pdbs, Some(&pod)), Some(0));
+    }
+
+    #[test]
+    fn a_pod_with_no_labels_is_never_selected() {
+        let pdbs = vec![pdb(&[("app", "api")], 2)];
+        assert_eq!(pdb_floor(&pdbs, None), None);
+    }
+
+    #[test]
+    fn workload_health_left_absent_keeps_proto_zero_values() {
+        let mut wl = WorkloadMetrics::default();
+        apply_workload_health(&mut wl, None);
+        assert_eq!(wl.oom_killed_count, 0);
+        assert_eq!(wl.restart_count, 0);
+        assert_eq!(wl.qos_class, "");
+        assert!(!wl.has_pdb);
+    }
+
+    #[test]
+    fn workload_health_carries_the_signals_that_make_shrinking_unsafe() {
+        let h = WorkloadHealth {
+            restart_count: 7,
+            oom_killed_count: 2,
+            qos_class: "Guaranteed".to_string(),
+            has_pdb: true,
+            pdb_min_available: 3,
+        };
+        let mut wl = WorkloadMetrics::default();
+        apply_workload_health(&mut wl, Some(&h));
+
+        assert_eq!(wl.oom_killed_count, 2);
+        assert_eq!(wl.restart_count, 7);
+        assert_eq!(wl.qos_class, "Guaranteed");
+        assert!(wl.has_pdb);
+        assert_eq!(wl.pdb_min_available, 3);
     }
 
     #[test]
