@@ -6,6 +6,7 @@ use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Event, Namespace, Node, Pod};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams};
@@ -251,6 +252,37 @@ fn node_meta(node: &Node) -> NodeMeta {
     }
 }
 
+/// One node's `[cpu_allocatable_m, memory_allocatable_mi, cpu_capacity_m,
+/// memory_capacity_mi]`, zeroed where the node status does not report them.
+///
+/// `allocatable` is capacity minus kubelet/system reservations and eviction
+/// thresholds — the figure a scheduler actually places pods against — so it is
+/// the one a packing calculation must divide by. `capacity` comes along because
+/// the gap between them is itself worth seeing.
+fn node_resources(node: &Node) -> [u32; 4] {
+    let status = match node.status.as_ref() {
+        Some(s) => s,
+        None => return [0; 4],
+    };
+    let read = |map: Option<&BTreeMap<String, Quantity>>, key: &str, cpu: bool| -> u32 {
+        map.and_then(|m| m.get(key))
+            .map(|q| {
+                if cpu {
+                    parse_cpu_to_millicores(&q.0)
+                } else {
+                    parse_memory_to_mib(&q.0)
+                }
+            })
+            .unwrap_or(0)
+    };
+    [
+        read(status.allocatable.as_ref(), "cpu", true),
+        read(status.allocatable.as_ref(), "memory", false),
+        read(status.capacity.as_ref(), "cpu", true),
+        read(status.capacity.as_ref(), "memory", false),
+    ]
+}
+
 /// Group nodes into pools keyed by (instance_type, region, capacity_type) and
 /// derive the cluster's primary region and cloud provider.
 ///
@@ -260,7 +292,9 @@ fn node_meta(node: &Node) -> NodeMeta {
 /// alphabetically for deterministic output); "" if no node reports a region.
 /// The cloud provider is the first non-empty providerID-derived value.
 pub fn aggregate_node_pools(nodes: &[Node]) -> (Vec<NodePool>, String, String) {
-    let mut counts: HashMap<(String, String, String), u32> = HashMap::new();
+    // Per pool: node count plus running totals of the four resource figures, so
+    // the emitted per-node values are an average over the pool's nodes.
+    let mut counts: HashMap<(String, String, String), (u32, [u64; 4])> = HashMap::new();
     let mut region_counts: HashMap<String, u32> = HashMap::new();
     let mut provider = String::new();
 
@@ -272,19 +306,38 @@ pub fn aggregate_node_pools(nodes: &[Node]) -> (Vec<NodePool>, String, String) {
         if !meta.region.is_empty() {
             *region_counts.entry(meta.region.clone()).or_default() += 1;
         }
-        *counts
+        let entry = counts
             .entry((meta.instance_type, meta.region, meta.capacity_type))
-            .or_default() += 1;
+            .or_insert((0, [0; 4]));
+        entry.0 += 1;
+        let [cpu_alloc, mem_alloc, cpu_cap, mem_cap] = node_resources(node);
+        entry.1[0] += cpu_alloc as u64;
+        entry.1[1] += mem_alloc as u64;
+        entry.1[2] += cpu_cap as u64;
+        entry.1[3] += mem_cap as u64;
     }
 
     let mut node_pools: Vec<NodePool> = counts
         .into_iter()
         .map(
-            |((instance_type, region, capacity_type), node_count)| NodePool {
-                instance_type,
-                region,
-                capacity_type,
-                node_count,
+            |((instance_type, region, capacity_type), (node_count, totals))| {
+                let per_node = |total: u64| -> u32 {
+                    if node_count == 0 {
+                        0
+                    } else {
+                        (total / node_count as u64).min(u32::MAX as u64) as u32
+                    }
+                };
+                NodePool {
+                    instance_type,
+                    region,
+                    capacity_type,
+                    node_count,
+                    cpu_allocatable_m: per_node(totals[0]),
+                    memory_allocatable_mi: per_node(totals[1]),
+                    cpu_capacity_m: per_node(totals[2]),
+                    memory_capacity_mi: per_node(totals[3]),
+                }
             },
         )
         .collect();
@@ -1523,6 +1576,53 @@ mod tests {
         assert_eq!(wl.hpa_max_replicas, 20);
         assert_eq!(wl.keda_min_replicas, 1);
         assert_eq!(wl.keda_trigger_types, "kafka");
+    }
+
+    // ── Node capacity ──────────────────────────────────────────────────────
+
+    fn node_with_resources(alloc_cpu: &str, alloc_mem: &str, cap_cpu: &str, cap_mem: &str) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "n", "labels": { "node.kubernetes.io/instance-type": "m5.large" } },
+            "status": {
+                "allocatable": { "cpu": alloc_cpu, "memory": alloc_mem },
+                "capacity": { "cpu": cap_cpu, "memory": cap_mem }
+            }
+        }))
+        .expect("node fixture should deserialize")
+    }
+
+    #[test]
+    fn node_resources_reads_allocatable_and_capacity() {
+        // Allocatable is deliberately lower than capacity: kubelet/system
+        // reservations and eviction thresholds come off the top, and it is
+        // allocatable that a scheduler actually places against.
+        let n = node_with_resources("1930m", "7134Mi", "2", "8Gi");
+        assert_eq!(node_resources(&n), [1930, 7134, 2000, 8192]);
+    }
+
+    #[test]
+    fn node_resources_are_zero_when_the_status_is_missing() {
+        let bare: Node = serde_json::from_value(serde_json::json!({ "metadata": { "name": "n" } }))
+            .expect("node fixture should deserialize");
+        assert_eq!(node_resources(&bare), [0; 4]);
+    }
+
+    #[test]
+    fn node_pool_capacity_is_per_node_not_the_pool_total() {
+        // Three identical nodes in one pool: the emitted figures describe ONE
+        // node, so a consumer multiplies by node_count. Summing instead would
+        // silently treble every packing calculation.
+        let nodes = vec![
+            node_with_resources("2", "8Gi", "2", "8Gi"),
+            node_with_resources("2", "8Gi", "2", "8Gi"),
+            node_with_resources("2", "8Gi", "2", "8Gi"),
+        ];
+        let (pools, _, _) = aggregate_node_pools(&nodes);
+
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].node_count, 3);
+        assert_eq!(pools[0].cpu_allocatable_m, 2000);
+        assert_eq!(pools[0].memory_allocatable_mi, 8192);
     }
 
     // ── Right-sizing guardrails ────────────────────────────────────────────
