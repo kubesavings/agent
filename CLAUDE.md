@@ -33,6 +33,7 @@ The execution flow is strictly linear — `main.rs` calls three modules in seque
    - Cost estimates use hardcoded rates: `CPU_COST_PER_VCPU_HOUR = $0.048`, `MEM_COST_PER_GB_HOUR = $0.006`. Monthly cost = request-based (not actual usage).
    - Cloud provider auto-detected from node labels (EKS/GKE/AKS) if not set via env.
    - Autoscaler context is fetched once per namespace and keyed by the `(kind, name)` pair a `scaleTargetRef` names: HPAs from `autoscaling/v2`, and KEDA `ScaledObject`s through the dynamic API. KEDA's CRD is absent on most clusters — that 404 is expected and logged at debug, never treated as a collection failure. A KEDA-scaled workload also carries an operator-managed HPA, so it legitimately reports both `has_hpa` and `keda_scaled`. DaemonSets are skipped: they have no `scale` subresource, so no HPA can target them.
+   - Right-sizing guardrails are aggregated in the same pod pass that resolves owners, so they cost no extra API calls: container restarts, OOMKilled terminations (read from `lastState.terminated`, where an OOMKill lands once the container restarted), the pod's QoS class, and whether a PodDisruptionBudget selects it. PDB matching honours `spec.selector.matchLabels` only — `matchExpressions` is vanishingly rare on PDBs, and a PDB using it selects nothing rather than misreporting. A percentage `minAvailable` yields 0, so `has_pdb` (not the count) is the flag that says a workload is guarded.
    - CronJobs are emitted as workloads (suspend state, `lastScheduleTime`, and a count of failed Jobs owned by each). Their requests are deliberately excluded from the namespace cost: a CronJob reserves capacity only while a run is in flight, so billing it for the whole month would inflate the namespace figure the zombie-namespace saving is derived from.
 
 3. **`sender.rs`** — Encodes `AgentSnapshot` as protobuf and POSTs to `{api_endpoint}/api/clusters/{cluster_id}/snapshot`. Retries only on 408, 429 and 5xx, with exponential backoff (5s → 20s, 3 attempts total, 30s per-attempt timeout). Every other status — 401, 403, 404, 4xx — fails immediately, since no retry can fix them. Worst-case wall clock stays inside the chart's 300s `activeDeadlineSeconds`; `backoff_delays()` is unit-tested against that budget.
@@ -104,7 +105,7 @@ helm upgrade --install kubesavings-agent \
 
 - Helm chart in `helm/` deploys as a `CronJob` (default schedule: `0 * * * *` — hourly).
 - Docker image is a static musl binary on `scratch`; built with cargo-chef for layer caching.
-- RBAC: read-only ClusterRole covering pods, nodes, namespaces, deployments, statefulsets, daemonsets, replicasets, cronjobs, jobs, events, horizontalpodautoscalers, KEDA scaledobjects, and the metrics API.
+- RBAC: read-only ClusterRole covering pods, nodes, namespaces, deployments, statefulsets, daemonsets, replicasets, cronjobs, jobs, events, horizontalpodautoscalers, poddisruptionbudgets, KEDA scaledobjects, and the metrics API.
 
 ---
 

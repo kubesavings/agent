@@ -33,6 +33,22 @@ message WorkloadMetrics {
   bool keda_scaled = 25;              // a KEDA ScaledObject targets this workload
   uint32 keda_min_replicas = 26;      // KEDA spec.minReplicaCount
   string keda_trigger_types = 27;     // comma-separated KEDA trigger types (e.g. "kafka,cron"); "" if none
+
+  // --- Right-sizing guardrails ---
+  //
+  // Right-sizing recommends shrinking requests toward observed usage. Nothing in
+  // the schema above says whether that is safe to do, so these carry the signals
+  // that make a recommendation harmful:
+  uint32 restart_count = 28;      // container restarts summed across the workload's pods
+  uint32 oom_killed_count = 29;   // containers whose last termination was OOMKilled;
+                                  // >0 means never recommend a smaller memory request
+  string qos_class = 30;          // "Guaranteed" | "Burstable" | "BestEffort"; "" if unknown.
+                                  // Guaranteed requires request == limit, so a request-only
+                                  // change silently demotes the pod and alters its eviction priority
+  bool has_pdb = 31;              // a PodDisruptionBudget selects this workload's pods
+  uint32 pdb_min_available = 32;  // PDB spec.minAvailable when an absolute count;
+                                  // 0 when expressed as a percentage or unset — read has_pdb, not this,
+                                  // to decide whether the workload is guarded
 }
 
 message NamespaceMetrics {
