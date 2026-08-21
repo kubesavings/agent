@@ -1,5 +1,5 @@
 # Stage 1: Build static binary using cargo-chef for proper layer caching
-FROM rust:1.96-slim AS chef
+FROM rust:1.97-slim AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     musl-tools \
