@@ -17,8 +17,24 @@ message WorkloadMetrics {
   double actual_memory_avg_mi = 12;
   double actual_memory_p95_mi = 13;
   uint32 observation_days = 14;
+
+  // The agent's own flat-rate estimate for this workload (request-based, at the
+  // collector's hardcoded CPU/memory rates). It is what the agent sums into
+  // NamespaceMetrics.estimated_monthly_cost_usd and AgentSnapshot
+  // .estimated_cluster_cost_usd, so it stays on the wire as the raw input behind
+  // both totals.
+  //
+  // The backend deliberately does not price anything from it: every category
+  // reprices from requests through cloud_pricing, using rates derived from the
+  // cluster's actual node pools. Two cost models on one dashboard is the problem
+  // that was already solved for zombie-namespace. Treat this as diagnostic - it
+  // shows what the agent thought - not as a figure to bill against.
   double estimated_monthly_cost_usd = 15;
-  string last_active_timestamp = 16;
+
+  // 16 was last_active_timestamp: the agent hardcoded it to "" from the first
+  // release and nothing ever read it. Reserved rather than reused, so a future
+  // field cannot inherit a tag that older agents may still emit.
+  reserved 16;
 
   // --- Autoscaler context (all optional; 0 / false / "" means "not present",
   // so the backend checks no-op until the agent starts populating them) ---
