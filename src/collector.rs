@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use chrono::Utc;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
@@ -34,6 +36,40 @@ pub enum CollectorError {
     Kube(#[from] kube::Error),
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Subsystems whose data this pass failed to fetch.
+///
+/// Every `warn!` in this module marks a list call that returned an error and was
+/// swallowed so the rest of the pass could continue. That is the right call — a
+/// snapshot missing its PodDisruptionBudgets still beats no snapshot — but it
+/// leaves the backend reading absence as measurement: no PDB rows looks exactly
+/// like no PDBs existing. Recording the subsystem is what separates the two.
+///
+/// Deduplicated because the failure is almost always the same permission or the
+/// same unreachable apiserver repeating once per namespace, and fifty copies of
+/// `pods` tells the reader nothing the first one didn't.
+#[derive(Default)]
+struct Degradations(Mutex<BTreeSet<&'static str>>);
+
+impl Degradations {
+    fn record(&self, subsystem: &'static str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(subsystem);
+    }
+
+    /// Sorted by construction — `BTreeSet` gives the wire a stable order, so two
+    /// snapshots degraded the same way compare equal instead of by luck.
+    fn into_vec(self) -> Vec<String> {
+        self.0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 /// Resolved workload owner for a pod (traced through ReplicaSet to Deployment if needed).
@@ -431,7 +467,11 @@ fn to_u32(v: i32) -> u32 {
 /// yields an empty map rather than an error. A KEDA-scaled workload also carries
 /// an operator-managed HPA, so it legitimately reports both `has_hpa` and
 /// `keda_scaled`.
-async fn fetch_autoscaler_context(client: &Client, ns: &str) -> AutoscalerMap {
+async fn fetch_autoscaler_context(
+    client: &Client,
+    ns: &str,
+    degraded: &Degradations,
+) -> AutoscalerMap {
     let mut map: AutoscalerMap = HashMap::new();
 
     let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), ns);
@@ -448,7 +488,10 @@ async fn fetch_autoscaler_context(client: &Client, ns: &str) -> AutoscalerMap {
                 }
             }
         }
-        Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_hpas"),
+        Err(e) => {
+            warn!(namespace = %ns, error = %e, "failed_to_list_hpas");
+            degraded.record("horizontalpodautoscalers");
+        }
     }
 
     // KEDA is a CRD most clusters do not have. Its absence is a 404 from the
@@ -557,7 +600,11 @@ fn keda_fields(spec: &Value) -> Option<KedaFields> {
 /// Only the Jobs the apiserver still holds are visible, and a CronJob's history
 /// limits (3 failed by default) bound that to recent runs — which is exactly the
 /// "recent failures" the wire schema asks for.
-async fn fetch_cronjob_failures(client: &Client, ns: &str) -> HashMap<String, u32> {
+async fn fetch_cronjob_failures(
+    client: &Client,
+    ns: &str,
+    degraded: &Degradations,
+) -> HashMap<String, u32> {
     let mut failures: HashMap<String, u32> = HashMap::new();
     let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
     match jobs.list(&ListParams::default()).await {
@@ -574,12 +621,20 @@ async fn fetch_cronjob_failures(client: &Client, ns: &str) -> HashMap<String, u3
                 }
             }
         }
-        Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_jobs"),
+        Err(e) => {
+            warn!(namespace = %ns, error = %e, "failed_to_list_jobs");
+            degraded.record("jobs");
+        }
     }
     failures
 }
 
 pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
+    // Timed from before the client handshake: connecting to the apiserver is part
+    // of what makes a pass slow, and excluding it would hide the most common cause.
+    let started = Instant::now();
+    let degraded = Degradations::default();
+
     let client = Client::try_default().await?;
 
     // Kubernetes version
@@ -623,7 +678,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 
     // Collect instantaneous pod metrics from the metrics-server.
     // Key: (namespace, pod_name) → Vec<ContainerMetric>
-    let (pod_metrics, metrics_available) = match fetch_pod_metrics(&client).await {
+    let (pod_metrics, metrics_available) = match fetch_pod_metrics(&client, &degraded).await {
         Some(m) => (m, true),
         None => (HashMap::new(), false),
     };
@@ -631,7 +686,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
     // Build pod → workload owner map (resolves ReplicaSet → Deployment).
     // Also returns the most-recent pod start time per namespace for activity tracking.
     let (pod_owner_map, pod_activity, workload_health) =
-        build_pod_owner_map(&client, &target_namespaces).await;
+        build_pod_owner_map(&client, &target_namespaces, &degraded).await;
 
     // Aggregate pod metrics into per-(workload, container) usage totals
     let usage_map = aggregate_workload_usage(&pod_metrics, &pod_owner_map);
@@ -647,7 +702,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 
         // HPA/KEDA context for this namespace, keyed by the (kind, name) pair a
         // scaleTargetRef names. Fetched once per namespace rather than per workload.
-        let autoscalers = fetch_autoscaler_context(&client, ns).await;
+        let autoscalers = fetch_autoscaler_context(&client, ns, &degraded).await;
 
         // Deployments
         let deployments: Api<Deployment> = Api::namespaced(client.clone(), ns);
@@ -697,7 +752,10 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                     ns_workload_count += 1;
                 }
             }
-            Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_deployments"),
+            Err(e) => {
+                warn!(namespace = %ns, error = %e, "failed_to_list_deployments");
+                degraded.record("deployments");
+            }
         }
 
         // StatefulSets
@@ -748,7 +806,10 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                     ns_workload_count += 1;
                 }
             }
-            Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_statefulsets"),
+            Err(e) => {
+                warn!(namespace = %ns, error = %e, "failed_to_list_statefulsets");
+                degraded.record("statefulsets");
+            }
         }
 
         // DaemonSets (one pod per node)
@@ -796,7 +857,10 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                     ns_workload_count += 1;
                 }
             }
-            Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_daemonsets"),
+            Err(e) => {
+                warn!(namespace = %ns, error = %e, "failed_to_list_daemonsets");
+                degraded.record("daemonsets");
+            }
         }
 
         // CronJobs. Emitted so the backend can see suspended/failing schedules and
@@ -810,7 +874,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                 let failures = if cj_list.items.is_empty() {
                     HashMap::new()
                 } else {
-                    fetch_cronjob_failures(&client, ns).await
+                    fetch_cronjob_failures(&client, ns, &degraded).await
                 };
 
                 for cj in cj_list.items {
@@ -856,7 +920,10 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
                     ns_workload_count += 1;
                 }
             }
-            Err(e) => warn!(namespace = %ns, error = %e, "failed_to_list_cronjobs"),
+            Err(e) => {
+                warn!(namespace = %ns, error = %e, "failed_to_list_cronjobs");
+                degraded.record("cronjobs");
+            }
         }
 
         namespace_workload_counts.insert(ns.clone(), ns_workload_count);
@@ -871,7 +938,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 
         // Use most-recent pod start time; supplement with events for namespaces with no pods
         let from_pods = pod_activity.get(ns).copied().unwrap_or(u32::MAX);
-        let from_events = fetch_namespace_last_activity_from_events(&client, ns).await;
+        let from_events = fetch_namespace_last_activity_from_events(&client, ns, &degraded).await;
         let days_since_last_activity = from_pods.min(from_events);
 
         namespaces.push(NamespaceMetrics {
@@ -889,10 +956,17 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 
     let estimated_cluster_cost_usd = workloads.iter().map(|w| w.estimated_monthly_cost_usd).sum();
 
+    // Saturating: a pass that somehow ran for 49 days reports the u32 ceiling
+    // rather than wrapping to a small number that reads as healthy.
+    let duration_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    let partial_failures = degraded.into_vec();
+
     info!(
         node_count,
         workloads = workloads.len(),
         namespaces = namespaces.len(),
+        duration_ms = duration_ms,
+        partial_failures = ?partial_failures,
         "collection_complete"
     );
 
@@ -908,6 +982,8 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
         node_pools,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         metrics_available,
+        collection_duration_ms: duration_ms,
+        partial_failures,
     })
 }
 
@@ -918,6 +994,7 @@ pub async fn collect(config: &Config) -> Result<AgentSnapshot, CollectorError> {
 async fn build_pod_owner_map(
     client: &Client,
     namespaces: &[String],
+    degraded: &Degradations,
 ) -> (
     HashMap<(String, String), PodOwner>,
     HashMap<String, u32>,
@@ -950,6 +1027,7 @@ async fn build_pod_owner_map(
                     .collect(),
                 Err(e) => {
                     warn!(namespace = %ns, error = %e, "failed_to_list_replicasets");
+                    degraded.record("replicasets");
                     HashMap::new()
                 }
             }
@@ -957,7 +1035,7 @@ async fn build_pod_owner_map(
 
         // PodDisruptionBudgets guarding pods in this namespace, reduced to the
         // (matchLabels, minAvailable) pairs the guardrail needs.
-        let pdbs = fetch_pdbs(client, ns).await;
+        let pdbs = fetch_pdbs(client, ns, degraded).await;
 
         let pods_api: Api<Pod> = Api::namespaced(client.clone(), ns);
         match pods_api.list(&ListParams::default()).await {
@@ -1049,6 +1127,7 @@ async fn build_pod_owner_map(
             }
             Err(e) => {
                 warn!(namespace = %ns, error = %e, "failed_to_list_pods");
+                degraded.record("pods");
             }
         }
     }
@@ -1066,7 +1145,11 @@ async fn build_pod_owner_map(
 ///
 /// `minAvailable` expressed as a percentage yields 0: `has_pdb` is the flag that
 /// says the workload is guarded, the count is supplementary.
-async fn fetch_pdbs(client: &Client, ns: &str) -> Vec<(BTreeMap<String, String>, u32)> {
+async fn fetch_pdbs(
+    client: &Client,
+    ns: &str,
+    degraded: &Degradations,
+) -> Vec<(BTreeMap<String, String>, u32)> {
     let api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), ns);
     match api.list(&ListParams::default()).await {
         Ok(list) => list
@@ -1087,6 +1170,7 @@ async fn fetch_pdbs(client: &Client, ns: &str) -> Vec<(BTreeMap<String, String>,
             .collect(),
         Err(e) => {
             warn!(namespace = %ns, error = %e, "failed_to_list_poddisruptionbudgets");
+            degraded.record("poddisruptionbudgets");
             Vec::new()
         }
     }
@@ -1219,7 +1303,11 @@ fn build_workload_metrics(
 /// (see `build_pod_owner_map`) for reliable zombie namespace detection.
 ///
 /// Returns `u32::MAX` if no events could be found (caller treats this as "unknown / active").
-async fn fetch_namespace_last_activity_from_events(client: &Client, ns: &str) -> u32 {
+async fn fetch_namespace_last_activity_from_events(
+    client: &Client,
+    ns: &str,
+    degraded: &Degradations,
+) -> u32 {
     let events_api: Api<Event> = Api::namespaced(client.clone(), ns);
     match events_api.list(&ListParams::default()).await {
         Ok(event_list) => {
@@ -1235,6 +1323,7 @@ async fn fetch_namespace_last_activity_from_events(client: &Client, ns: &str) ->
         }
         Err(e) => {
             warn!(namespace = %ns, error = %e, "failed_to_fetch_events");
+            degraded.record("events");
             u32::MAX
         }
     }
@@ -1250,6 +1339,7 @@ async fn fetch_namespace_last_activity_from_events(client: &Client, ns: &str) ->
 /// an idle cluster from one with no metrics-server installed.
 async fn fetch_pod_metrics(
     client: &Client,
+    degraded: &Degradations,
 ) -> Option<HashMap<(String, String), Vec<ContainerMetric>>> {
     let req = match http::Request::builder()
         .uri("/apis/metrics.k8s.io/v1beta1/pods")
@@ -1258,6 +1348,7 @@ async fn fetch_pod_metrics(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "failed_to_build_metrics_request");
+            degraded.record("metrics-server");
             return None;
         }
     };
@@ -1266,6 +1357,7 @@ async fn fetch_pod_metrics(
         Ok(val) => Some(parse_pod_metrics_json(&val)),
         Err(e) => {
             warn!(error = %e, "metrics_server_unavailable_continuing_without_usage_data");
+            degraded.record("metrics-server");
             None
         }
     }
@@ -2143,5 +2235,25 @@ mod tests {
         );
         assert_eq!(capacity_type_from_labels(&on_demand), "on-demand");
         assert_eq!(capacity_type_from_labels(&BTreeMap::new()), "on-demand");
+    }
+
+    #[test]
+    fn degradations_dedup_and_sort() {
+        let d = Degradations::default();
+        // The same subsystem failing once per namespace is the common case.
+        d.record("pods");
+        d.record("pods");
+        d.record("metrics-server");
+        d.record("deployments");
+        assert_eq!(
+            d.into_vec(),
+            vec!["deployments", "metrics-server", "pods"],
+            "one entry per subsystem, in a stable order"
+        );
+    }
+
+    #[test]
+    fn degradations_empty_on_a_clean_pass() {
+        assert!(Degradations::default().into_vec().is_empty());
     }
 }
