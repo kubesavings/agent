@@ -24,7 +24,7 @@ agent:
 
   image:
     repository: ghcr.io/kubesavings/agent
-    tag: "1.7.0"
+    tag: "1.8.0"
     pullPolicy: IfNotPresent
 
   # The agent holds the cluster's pod/workload lists in memory for the duration

@@ -97,6 +97,24 @@ message AgentSnapshot {
   // (false) from an older agent, which the backend must treat as "unknown"
   // rather than "no metrics".
   bool metrics_available = 11;
+
+  // Wall-clock time the collection pass took, in milliseconds. 0 = not reported
+  // (older agent), which is indistinguishable from an impossibly fast pass only
+  // in theory: a real pass always costs at least one API round trip.
+  uint32 collection_duration_ms = 12;
+
+  // Subsystems whose data the pass failed to fetch, deduplicated and sorted -
+  // e.g. "pods", "metrics-server", "poddisruptionbudgets". Empty = a clean pass.
+  //
+  // These are non-fatal: the collector logs a warning and carries on with the
+  // rest, so the snapshot still arrives. The numbers alone cannot say whether a
+  // workload has no PodDisruptionBudget or whether the PDB list call failed, and
+  // a recommendation derived from the second case is wrong rather than merely
+  // incomplete. This is what lets the backend tell them apart.
+  //
+  // A missing KEDA CRD is deliberately absent from this list: it is the normal
+  // state of most clusters, not a failure.
+  repeated string partial_failures = 13;
 }
 
 message SnapshotResponse {

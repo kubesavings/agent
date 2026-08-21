@@ -50,6 +50,8 @@ fn snapshot_carries_node_pools_and_region_through_protobuf() {
         node_pools,
         agent_version: "1.2.0".to_string(),
         metrics_available: true,
+        collection_duration_ms: 1_234,
+        partial_failures: vec!["metrics-server".to_string()],
     };
 
     // Round-trip through protobuf, exactly as the sender does.
@@ -76,4 +78,9 @@ fn snapshot_carries_node_pools_and_region_through_protobuf() {
     assert_eq!(m5.node_count, 2);
     assert_eq!(m5.region, "us-east-1");
     assert_eq!(m5.capacity_type, "on-demand");
+
+    // Collection health survives the wire. `partial_failures` matters most here:
+    // a repeated string field that silently dropped would read as a clean pass.
+    assert_eq!(decoded.collection_duration_ms, 1_234);
+    assert_eq!(decoded.partial_failures, vec!["metrics-server".to_string()]);
 }
